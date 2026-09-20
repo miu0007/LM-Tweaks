@@ -1,0 +1,9 @@
+MLTweaks - permissions
+
+Do whatever you like with this. You may modify it, reuse any part of it, and
+redistribute it - including a modified version, on any site - without asking
+first. A credit and a link back are appreciated but not required.
+
+This applies to the source code and to the built DLL alike.
+
+No warranty of any kind. Use at your own risk.

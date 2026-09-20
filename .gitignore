@@ -1,0 +1,14 @@
+# Written by the mod at runtime
+native.cfg
+native_log.txt
+report.txt
+crop_settings.txt
+debug_*.txt
+units_snapshot.txt
+
+# Build output
+native/build/
+*.obj
+*.pdb
+*.exp
+*.lib
