@@ -38,6 +38,22 @@ local WILD_RESOURCE_BP = {
     { class = "Resource_Eel_C",       key = "Eel" },
 }
 
+-- Settings that only the native DLL can apply. When none of them is switched on, the DLL is
+-- not loaded at all (it would have nothing to do), which also keeps the Lite package - the
+-- same mod without the DLL - free of load errors.
+local function nativeNeeded()
+    local ym, gm = cfg.CropYieldMultiplier or {}, cfg.CropGrowthMultiplier or {}
+    for _, g in ipairs({ "Grains", "Vegetables", "Fruits" }) do
+        if (ym[g] or 1) ~= 1 or (gm[g] or 1) ~= 1 then return true end
+    end
+    local wl = cfg.Wildlife or {}
+    return (cfg.AllResourcesRich or cfg.HarvestAnytime or cfg.NoFertilityLoss
+        or (cfg.HarvestGrowthThreshold or 0) > 0
+        or (cfg.HandCarryAmount or 0) > 1 or (cfg.CartCarryAmount or 0) > 1
+        or cfg.FreeOxen or #(cfg.FreeAnimalOrders or {}) > 0
+        or wl.SoloBreeding or (wl.MaxMultiplier or 1) > 1) and true or false
+end
+
 local function loadNativePatches()
     local f = io.open(MOD_DIR .. "native.cfg", "w")
     if not f then log("native: cannot write native.cfg"); return end
@@ -67,12 +83,26 @@ local function loadNativePatches()
     f:write("WildlifeBreed=" .. (wl.SoloBreeding and "1" or "0") .. "\n")
     f:write("WildlifeMax=" .. tostring(math.floor(wl.MaxMultiplier or 1)) .. "\n")
     f:close()
+    if not nativeNeeded() then
+        log("native: no setting needs MLTweaksNative.dll - not loaded")
+        return
+    end
+    local dll = MOD_DIR .. "native/MLTweaksNative.dll"
+    local probe = io.open(dll, "rb")
+    if not probe then
+        log("native: MLTweaksNative.dll not found (Lite package?) - crop, carrying, rich resource,")
+        log("        free animal order and herd cap settings are ignored")
+        return
+    end
+    probe:close()
     if not package or not package.loadlib then log("native: package.loadlib not available"); return end
-    local ok, err = package.loadlib(MOD_DIR .. "native/MLTweaksNative.dll", "*")
+    local init, err = package.loadlib(dll, "MLTweaks_Init")
+    if not init then log("native: failed to load DLL: " .. tostring(err)); return end
+    local ok, e = pcall(init)
     if ok then
         log("native: MLTweaksNative.dll loaded (see native_log.txt)")
     else
-        log("native: failed to load DLL: " .. tostring(err))
+        log("native: MLTweaks_Init failed: " .. tostring(e))
     end
 end
 

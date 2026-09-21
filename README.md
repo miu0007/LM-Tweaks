@@ -1,10 +1,14 @@
-# MLTweaks 1.0.0
+# MLTweaks 1.1.0
 
 A configurable tweak mod for **Manor Lords**. One settings file lets you scale production,
 storage, carrying, crops, wildlife and more. Out of the box it changes **nothing** - every
 value ships at its vanilla setting, so you turn on only what you want.
 
 Tested on Manor Lords **0.8.104** (Steam) with UE4SS.
+
+Prefer no DLL at all? **MLTweaks Lite** is the same mod without the native part - see the
+optional files. It covers everything except crops, carrying, rich resources, free ox / animal
+orders and the wildlife population cap.
 
 ---
 
@@ -116,6 +120,12 @@ Two parts:
   so after a game update a patch that no longer fits is skipped and logged instead of corrupting
   anything. **The game executable on disk is never modified.**
 
+The DLL is only loaded when at least one setting needs it - with the default settings it is
+not loaded at all. When it is, Lua calls its single exported function, `MLTweaks_Init`; the DLL
+does nothing on its own when Windows loads it. Code the DLL generates for its hooks is written
+to read/write memory that is switched to execute/read before use, so the DLL never keeps memory
+that is writable and executable at the same time.
+
 The DLL's source is included in `native/src/` and it builds with `native/build.bat`
 (Visual Studio 2022 Build Tools, `cl /O2 /MT /LD`).
 
@@ -139,6 +149,7 @@ None of these break a vanilla game - they just stay at the value they reached.
 
 ## Troubleshooting
 
+- **`report.txt` says the DLL was "not loaded"** - that is expected when no setting needs it.
 - **Nothing happens** - check `report.txt` exists. If it does not, UE4SS is not loading the mod
   (is `enabled.txt` still in the folder?).
 - **A feature does nothing after a game update** - open `native_log.txt`. A line ending in
@@ -148,6 +159,21 @@ None of these break a vanilla game - they just stay at the value they reached.
   effects is the most invasive thing this mod does.
 - **Changed a value and nothing happened** - the game has to be restarted; hot reload is not
   supported.
+
+## Changelog
+
+**1.1.0**
+- The DLL is no longer loaded unless a setting needs it. With the default settings the mod now
+  runs on Lua alone.
+- The DLL's work moved out of `DllMain` into an explicit `MLTweaks_Init` call from Lua.
+- Code generated for hooks no longer sits in writable-and-executable memory.
+- The DLL carries version information (Properties > Details) and writes its version on the first
+  line of `native_log.txt`.
+- `build.bat` creates its `build` folder itself, so a fresh clone builds without errors.
+- New optional file: MLTweaks Lite, without the DLL.
+
+**1.0.0**
+- First release.
 
 ## Permissions
 

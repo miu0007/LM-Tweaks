@@ -14,6 +14,7 @@
 namespace {
 
 const char* kModDir = "ue4ss\\Mods\\MLTweaks\\";
+const char* kVersion = "1.1.0";
 
 FILE* g_log = nullptr;
 
@@ -164,6 +165,18 @@ bool WriteCode(uint8_t* at, const std::vector<int>& bytes)
     return true;
 }
 
+// Code this DLL generates (trampolines, code caves) is written while its page is read/write
+// only and then switched to execute/read, so none of our pages is ever writable and executable
+// at the same time. (WriteCode above cannot do that for the game's own code: other threads may
+// be running it, so its page has to stay executable for the few instructions of the write.)
+bool SealCode(uint8_t* at, size_t size)
+{
+    DWORD old;
+    if (!VirtualProtect(at, size, PAGE_EXECUTE_READ, &old)) return false;
+    FlushInstructionCache(GetCurrentProcess(), at, size);
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Carry capacity: detour of the "new transport task" function
 //   void NewTransportTask(SMUnit* unit, SMBuildingMaster* from, SMBuildingMaster* to, int goodType, int amount)
@@ -242,12 +255,13 @@ bool InstallTransportHook(uint8_t* text, size_t textSize)
     uint8_t* target = hits[0];
 
     // trampoline: stolen bytes + jmp [rip] back to target+kStolenBytes
-    auto tramp = static_cast<uint8_t*>(VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    auto tramp = static_cast<uint8_t*>(VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
     if (!tramp) { Log("[Carry] VirtualAlloc failed"); return false; }
     memcpy(tramp, target, kStolenBytes);
     uint8_t* j = tramp + kStolenBytes;
     j[0] = 0xFF; j[1] = 0x25; *reinterpret_cast<uint32_t*>(j + 2) = 0;
     *reinterpret_cast<uint64_t*>(j + 6) = reinterpret_cast<uint64_t>(target + kStolenBytes);
+    if (!SealCode(tramp, 64)) { Log("[Carry] VirtualProtect failed"); return false; }
     g_origTransport = reinterpret_cast<TransportFn>(tramp);
 
     // detour: jmp [rip] -> TransportHook, pad with nop
@@ -284,7 +298,7 @@ uint8_t* AllocNear(uint8_t* target, size_t size)
             uintptr_t a = (sign < 0) ? (t > d ? t - d : 0) : t + d;
             if (!a) continue;
             a &= ~(gran - 1);
-            void* p = VirtualAlloc(reinterpret_cast<void*>(a), size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            void* p = VirtualAlloc(reinterpret_cast<void*>(a), size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if (p) return static_cast<uint8_t*>(p);
         }
     }
@@ -329,7 +343,7 @@ bool InstallHarvestHook(uint8_t* text, size_t textSize)
         for (int i = 0; i < 4; ++i) c.push_back(static_cast<uint8_t>(static_cast<uint32_t>(v) >> (8 * i)));
     *reinterpret_cast<int32_t*>(&c[leaPos + 3]) = static_cast<int32_t>(tablePos - (leaPos + 7));
     memcpy(cave, c.data(), c.size());
-    FlushInstructionCache(GetCurrentProcess(), cave, c.size());
+    if (!SealCode(cave, c.size())) { Log("VirtualProtect on a code cave failed"); return false; }
 
     int64_t rel = reinterpret_cast<int64_t>(cave) - reinterpret_cast<int64_t>(site + 5);
     if (rel > INT32_MAX || rel < INT32_MIN) { Log("[CropYield] cave out of range"); return false; }
@@ -395,7 +409,7 @@ bool InstallFetchCapacityHook(uint8_t* text, size_t textSize)
     uint64_t v = reinterpret_cast<uint64_t>(back);
     for (int i = 0; i < 8; ++i) c.push_back(static_cast<uint8_t>(v >> (8 * i)));
     memcpy(cave, c.data(), c.size());
-    FlushInstructionCache(GetCurrentProcess(), cave, c.size());
+    if (!SealCode(cave, c.size())) { Log("VirtualProtect on a code cave failed"); return false; }
 
     int64_t rel = reinterpret_cast<int64_t>(cave) - reinterpret_cast<int64_t>(site + 5);
     if (rel > INT32_MAX || rel < INT32_MIN) { Log("[Carry] fetch capacity: cave out of range"); return false; }
@@ -450,12 +464,13 @@ bool InstallUpgradeCostHook(uint8_t* text, size_t textSize)
     uint8_t* target = hits[0];
 
     // trampoline: stolen bytes + jmp [rip] back to target+kUpgradeCostStolen
-    auto tramp = static_cast<uint8_t*>(VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    auto tramp = static_cast<uint8_t*>(VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
     if (!tramp) { Log("[FreeUpgrade] VirtualAlloc failed"); return false; }
     memcpy(tramp, target, kUpgradeCostStolen);
     uint8_t* j = tramp + kUpgradeCostStolen;
     j[0] = 0xFF; j[1] = 0x25; *reinterpret_cast<uint32_t*>(j + 2) = 0;
     *reinterpret_cast<uint64_t*>(j + 6) = reinterpret_cast<uint64_t>(target + kUpgradeCostStolen);
+    if (!SealCode(tramp, 64)) { Log("[FreeUpgrade] VirtualProtect failed"); return false; }
     g_origUpgradeCost = reinterpret_cast<UpgradeCostFn>(tramp);
 
     // detour: jmp [rip] -> UpgradeCostHook, pad with nop
@@ -512,7 +527,7 @@ bool InstallWildlifeCapHook(uint8_t* text, size_t textSize)
     uint64_t v = reinterpret_cast<uint64_t>(back);
     for (int i = 0; i < 8; ++i) c.push_back(static_cast<uint8_t>(v >> (8 * i)));
     memcpy(cave, c.data(), c.size());
-    FlushInstructionCache(GetCurrentProcess(), cave, c.size());
+    if (!SealCode(cave, c.size())) { Log("VirtualProtect on a code cave failed"); return false; }
 
     int64_t rel = reinterpret_cast<int64_t>(cave) - reinterpret_cast<int64_t>(site + 5);
     if (rel > INT32_MAX || rel < INT32_MIN) { Log("[WildlifeMax] cave out of range"); return false; }
@@ -658,7 +673,7 @@ void ApplyPatches()
 {
     std::string dir = kModDir;
     fopen_s(&g_log, (dir + "native_log.txt").c_str(), "w");
-    Log("MLTweaksNative loaded");
+    Log("MLTweaksNative %s loaded", kVersion);
 
     std::string cfg = ReadFileText(dir + "native.cfg");
     if (cfg.empty()) Log("native.cfg not found or empty - nothing enabled");
@@ -779,9 +794,19 @@ void ApplyPatches()
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 {
-    if (reason == DLL_PROCESS_ATTACH) {
-        DisableThreadLibraryCalls(module);
+    if (reason == DLL_PROCESS_ATTACH) DisableThreadLibraryCalls(module);
+    return TRUE;
+}
+
+// Entry point, called from Lua as package.loadlib(dll, "MLTweaks_Init")(). The signature
+// matches lua_CFunction (int f(lua_State*)); the state is unused and nothing is returned.
+// Doing the work here instead of in DllMain keeps it out of the loader lock.
+extern "C" __declspec(dllexport) int MLTweaks_Init(void*)
+{
+    static bool done = false;
+    if (!done) {
+        done = true;
         ApplyPatches();
     }
-    return TRUE;
+    return 0;
 }
