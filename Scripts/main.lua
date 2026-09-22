@@ -488,15 +488,9 @@ tasks.superPerk = function()
 end
 
 -- 6b. Militia squad size
--- The template only seeds new squads; every existing squad keeps its own maxSize
--- (RTSMultiEngineCPP.squads), which liveTick raises for the player's militia squads.
-local militiaTypes = {}   -- DT_UnitTemplates row names with isMilitia
-
-local function nameStr(x)
-    if type(x) == "string" then return x end
-    return S(function() return x:ToString() end, tostring(x))
-end
-
+-- Each squad keeps its own maxSize (RTSMultiEngineCPP.squads), taken from this template
+-- when the game sets the squad up: new squads, and squads without men when another squad
+-- is formed. A squad with men keeps its old size until then.
 tasks.militiaSize = function()
     local size = cfg.MilitiaSquadMaxSize or 0
     if size <= 0 then return true end
@@ -506,7 +500,6 @@ tasks.militiaSize = function()
     dt:ForEachRow(function(rowName, row)
         if S(function() return row.isMilitia end, false) then
             pcall(function() row.maxSize = size end); n = n + 1
-            militiaTypes[nameStr(rowName)] = true
         end
     end)
     log(string.format("militia squad size: %d templates -> %d", n, size))
@@ -726,37 +719,6 @@ local function liveTick()
     if pawn then
         local cs = S(function() return pawn.commandedSquads end)
         for i = 1, arrLen(cs) do playerSquads[S(function() return cs[i] end, -1)] = true end
-    end
-
-    -- 6b. militia squad size of the player's existing squads
-    local squadSize = cfg.MilitiaSquadMaxSize or 0
-    if squadSize > 0 and next(militiaTypes) then
-        -- militia squads that are not called up are missing from commandedSquads; the squad
-        -- cards (playersSquadsUIOrder) list all of the player's squads
-        local mine = {}
-        for id in pairs(playerSquads) do mine[id] = true end
-        local ui = S(function() return engine.playersSquadsUIOrder end)
-        for i = 1, arrLen(ui) do mine[S(function() return ui[i] end, -1)] = true end
-        if (checkCount.squadList or 0) == 0 then
-            checkLog("squadList", "player squads: commanded [" .. intsStr(S(function() return pawn.commandedSquads end)) ..
-                "] cards [" .. intsStr(ui) .. "]")
-        end
-        local sqs = S(function() return engine.squads end)
-        for i = 1, arrLen(sqs) do
-            local s = S(function() return sqs[i] end)
-            local id = s and S(function() return s.ID end, -1) or -1
-            if mine[id] then
-                local ut = nameStr(S(function() return s.unitType end, ""))
-                local cur = S(function() return s.maxSize end, -1)
-                if militiaTypes[ut] and cur ~= squadSize then
-                    pcall(function() s.maxSize = squadSize end)
-                    checkLog("squadSize", string.format("squad %d (%s): maxSize %d -> %d",
-                        id, ut, cur, S(function() return s.maxSize end, -1)))
-                elseif not militiaTypes[ut] then
-                    checkLog("squadSkip", string.format("squad %d (%s): not militia, maxSize %d", id, ut, cur))
-                end
-            end
-        end
     end
 
     -- 4a / 5. units

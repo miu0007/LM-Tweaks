@@ -70,6 +70,7 @@ return {
     -- 8. Militia
     MaxMilitiaSquads              = 0,   -- number of militia squads (game default 6). 0 = leave unchanged
     MilitiaSquadMaxSize           = 0,   -- men per militia squad. 0 = leave unchanged
+                                         -- (new squads; a squad with men keeps its size)
 
     -- 9. Growth speed of saplings planted by foresters. 2 = twice as fast. 0 = leave unchanged
     --    (vanilla: the first growth stage alone takes about 250 days)

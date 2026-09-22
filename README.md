@@ -110,7 +110,9 @@ These are implemented but their in-game effect was never confirmed. They are off
 
 - Archer damage for archers whose base ranged attack is 0 (the multiplier has nothing to scale).
   Range, and damage with war bows and crossbows, were checked.
-- Militia squad size (the squad cap was checked)
+- Militia squad size: squads show the new size (it applies to squads formed afterwards, and to
+  squads without men when another squad is formed), but a squad filling past 36 men was not
+  watched. The squad cap was checked.
 - Bandit camp cap and raid interval
 
 Everything else in the list above was checked in game.
