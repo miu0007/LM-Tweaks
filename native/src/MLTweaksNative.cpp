@@ -14,7 +14,7 @@
 namespace {
 
 const char* kModDir = "ue4ss\\Mods\\MLTweaks\\";
-const char* kVersion = "1.1.0";
+const char* kVersion = "1.2.0-dev";
 
 FILE* g_log = nullptr;
 
@@ -542,6 +542,88 @@ bool InstallWildlifeCapHook(uint8_t* text, size_t textSize)
 }
 
 // ---------------------------------------------------------------------------
+// BurgageFamilies: how many families a house holds. The building table is NOT used for this
+// (buildingStats.occupantTypes.Y is ignored); two small functions compute it:
+//   SMBuildingMaster::getFamilyCapacity()            8 callers: living space, homeless
+//                                                    assignment, save load, ...
+//   SMBuildingMaster::getMaxOccupantsOfRole(role)    Blueprint, the residents panel
+// Both do: worker camp (bType 111) -> 5; not residential (+0x3BC != 1) -> 0; otherwise
+//   extensions (+0x430, byte) + base, base = 3 for house level 4, 2 for level 3, else 1
+//   (house level at +0xCA8, set to 1 on construction and 2/3/4 by the plot upgrades).
+// getMaxOccupantsOfRole returns that for roles 0..2 and 0 for any other role.
+// Both are replaced outright - a jump to one implementation here, the original body never
+// runs - so the panel and the game logic can never disagree. A level left at 0 in the
+// config keeps its vanilla base.
+// ---------------------------------------------------------------------------
+const char* kFamilyCapSig =        // "CC CC" = padding before the function; the body alone
+    "CC CC 83 B9 A8 03 00 00 6F 75 06 B8 05 00 00 00 C3 80 B9 BC 03 00 00 01 75 ?? "
+    "8B 91 A8 0C 00 00 0F B6 81 30 04 00 00 83 FA 04";   // also occurs inside the role variant
+const int kFamilyCapOffset = 2;
+const char* kOccupantsOfRoleSig =
+    "44 0F B6 C2 84 D2 74 ?? 41 83 E8 01 74 ?? 41 83 E8 01 75 ?? 83 B9 A8 03 00 00 6F";
+const size_t kBuildingTypeOff = 0x3A8, kIsResidential = 0x3BC, kExtensions = 0x430, kHouseLevel = 0xCA8;
+int g_familiesPerLevel[5] = {};    // index = house level 1..4, 0 = vanilla
+
+int VanillaFamilyBase(int level) { return level == 4 ? 3 : (level == 3 ? 2 : 1); }
+
+int __fastcall FamilyCapacityHook(uint8_t* b)
+{
+    if (*reinterpret_cast<int*>(b + kBuildingTypeOff) == 111) return 5;   // worker camp
+    if (b[kIsResidential] != 1) return 0;
+    int level = *reinterpret_cast<int*>(b + kHouseLevel);
+    int base = (level >= 1 && level <= 4 && g_familiesPerLevel[level] > 0)
+        ? g_familiesPerLevel[level] : VanillaFamilyBase(level);
+    return b[kExtensions] + base;
+}
+
+int __fastcall OccupantsOfRoleHook(uint8_t* b, uint8_t role)
+{
+    return role <= 2 ? FamilyCapacityHook(b) : 0;
+}
+
+// Overwrites the start of a function with "jmp [rip] -> hook" (14 bytes).
+bool ReplaceFunction(uint8_t* text, size_t textSize, const char* sigText, int offset, void* hook, const char* what)
+{
+    std::vector<int> sig;
+    ParseHex(sigText, sig);
+    auto hits = FindAll(text, textSize, sig);
+    if (hits.size() != 1) {
+        Log("[BurgageFamilies] %s: signature found %zu times - SKIPPED", what, hits.size());
+        return false;
+    }
+    uint8_t* site = hits[0] + offset;
+    std::vector<int> patch = { 0xFF, 0x25, 0, 0, 0, 0 };
+    uint64_t addr = reinterpret_cast<uint64_t>(hook);
+    for (int i = 0; i < 8; ++i) patch.push_back(static_cast<int>((addr >> (8 * i)) & 0xFF));
+    if (!WriteCode(site, patch)) { Log("[BurgageFamilies] %s: VirtualProtect failed", what); return false; }
+    Log("[BurgageFamilies] %s replaced at exe+0x%llX", what,
+        static_cast<unsigned long long>(site - reinterpret_cast<uint8_t*>(GetModuleHandleA(nullptr))));
+    return true;
+}
+
+bool InstallFamilyCapacityHooks(uint8_t* text, size_t textSize)
+{
+    // resolve both sites first, so a partial install (one hooked, one not) cannot happen
+    std::vector<int> a, b;
+    ParseHex(kFamilyCapSig, a);
+    ParseHex(kOccupantsOfRoleSig, b);
+    if (FindAll(text, textSize, a).size() != 1 || FindAll(text, textSize, b).size() != 1) {
+        Log("[BurgageFamilies] signatures not unique - SKIPPED (game version changed?)");
+        return false;
+    }
+    bool ok = ReplaceFunction(text, textSize, kFamilyCapSig, kFamilyCapOffset,
+                              reinterpret_cast<void*>(&FamilyCapacityHook), "family capacity");
+    ok = ReplaceFunction(text, textSize, kOccupantsOfRoleSig, 0,
+                         reinterpret_cast<void*>(&OccupantsOfRoleHook), "max occupants of role") && ok;
+    std::string v;
+    for (int lv = 1; lv <= 4; ++lv)
+        v += "Lv" + std::to_string(lv) + "=" + (g_familiesPerLevel[lv] > 0 ? std::to_string(g_familiesPerLevel[lv])
+                                                                              : std::to_string(VanillaFamilyBase(lv)) + "(vanilla)") + (lv < 4 ? " " : "");
+    Log("[BurgageFamilies] base families per house level: %s, +1 per extension", v.c_str());
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
 // Diagnostics: dump UCropSettings (16 entries per array, incl. Oats = index 15).
 // The getter caches the UClass in a global; the CDO sits at UClass+0x110.
 // Read-only, runs on a background thread once the settings exist.
@@ -785,6 +867,18 @@ void ApplyPatches()
     g_wildlifeMax = ConfigInt(cfg, "WildlifeMax", 1);
     if (g_wildlifeMax > 1 && g_wildlifeMax <= 1000) InstallWildlifeCapHook(text, textSize);
     else Log("[WildlifeMax] disabled");
+
+    // FamiliesLvN=M : base families per house of level N (0 = vanilla)
+    {
+        bool any = false;
+        for (int lv = 1; lv <= 4; ++lv) {
+            int v = ConfigInt(cfg, ("FamiliesLv" + std::to_string(lv)).c_str(), 0);
+            g_familiesPerLevel[lv] = (v >= 1 && v <= 50) ? v : 0;
+            if (g_familiesPerLevel[lv] > 0) any = true;
+        }
+        if (any) InstallFamilyCapacityHooks(text, textSize);
+        else Log("[BurgageFamilies] disabled");
+    }
 
     Log("done");
     if (g_log) { fclose(g_log); g_log = nullptr; }

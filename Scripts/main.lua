@@ -41,6 +41,14 @@ local WILD_RESOURCE_BP = {
 -- Settings that only the native DLL can apply. When none of them is switched on, the DLL is
 -- not loaded at all (it would have nothing to do), which also keeps the Lite package - the
 -- same mod without the DLL - free of load errors.
+local function familiesSet()
+    local bf = cfg.BurgageFamilies or {}
+    for lv = 1, 4 do
+        if (bf["Lv" .. lv] or 0) > 0 then return true end
+    end
+    return false
+end
+
 local function nativeNeeded()
     local ym, gm = cfg.CropYieldMultiplier or {}, cfg.CropGrowthMultiplier or {}
     for _, g in ipairs({ "Grains", "Vegetables", "Fruits" }) do
@@ -51,7 +59,8 @@ local function nativeNeeded()
         or (cfg.HarvestGrowthThreshold or 0) > 0
         or (cfg.HandCarryAmount or 0) > 1 or (cfg.CartCarryAmount or 0) > 1
         or cfg.FreeOxen or #(cfg.FreeAnimalOrders or {}) > 0
-        or wl.SoloBreeding or (wl.MaxMultiplier or 1) > 1) and true or false
+        or wl.SoloBreeding or (wl.MaxMultiplier or 1) > 1
+        or familiesSet()) and true or false
 end
 
 local function loadNativePatches()
@@ -82,6 +91,8 @@ local function loadNativePatches()
     local wl = cfg.Wildlife or {}
     f:write("WildlifeBreed=" .. (wl.SoloBreeding and "1" or "0") .. "\n")
     f:write("WildlifeMax=" .. tostring(math.floor(wl.MaxMultiplier or 1)) .. "\n")
+    local bf = cfg.BurgageFamilies or {}
+    for lv = 1, 4 do f:write(string.format("FamiliesLv%d=%d\n", lv, math.floor(bf["Lv" .. lv] or 0))) end
     f:close()
     if not nativeNeeded() then
         log("native: no setting needs MLTweaksNative.dll - not loaded")
@@ -91,7 +102,7 @@ local function loadNativePatches()
     local probe = io.open(dll, "rb")
     if not probe then
         log("native: MLTweaksNative.dll not found (Lite package?) - crop, carrying, rich resource,")
-        log("        free animal order and herd cap settings are ignored")
+        log("        free animal order, herd cap and families per house settings are ignored")
         return
     end
     probe:close()
@@ -125,6 +136,23 @@ local function fstr(v) return S(function() return v:ToString() end, tostring(v))
 
 -- TArray helpers (UE4SS TArrays are 1-indexed)
 local function arrLen(a) return S(function() return #a end, 0) end
+
+-- "(x,y,z,w)" for a Vector4 struct, "?" when it cannot be read
+local function vec4Str(v)
+    if not v then return "?" end
+    local c = {}
+    for _, k in ipairs({ "X", "Y", "Z", "W" }) do
+        table.insert(c, string.format("%g", S(function() return v[k] end, 0/0)))
+    end
+    return "(" .. table.concat(c, ",") .. ")"
+end
+
+-- "a,b,c" for a TArray of ints
+local function intsStr(arr)
+    local out = {}
+    for i = 1, arrLen(arr) do table.insert(out, tostring(S(function() return arr[i] end, "?"))) end
+    return table.concat(out, ",")
+end
 
 -- ============================================================
 -- Live value tracker: re-applies a multiplier whenever the game resets a value,
@@ -237,10 +265,14 @@ tasks.debugDump = function()
     if bs then
         table.insert(L, "")
         bs:ForEachRow(function(rowName, row)
-            table.insert(L, string.format("BUILDING %s | %s | storage G=%s L=%s P=%s | prod=[%s]",
+            table.insert(L, string.format("BUILDING %s | %s | storage G=%s L=%s P=%s | occ=%s work=%s lvl=%s from=%s upg=[%s] | prod=[%s]",
                 tostring(rowName), fstr(S(function() return row.DisplayName end, "")),
                 tostring(S(function() return row.storageLimitGeneric end, "?")), tostring(S(function() return row.storageLimitLarge end, "?")),
-                tostring(S(function() return row.storageLimitPantry end, "?")), goodsStr(S(function() return row.averageProduction end))))
+                tostring(S(function() return row.storageLimitPantry end, "?")),
+                vec4Str(S(function() return row.occupantTypes end)), vec4Str(S(function() return row.workerTypes end)),
+                tostring(S(function() return row.settlementLevel end, "?")), tostring(S(function() return row.upgradedFrom end, "?")),
+                intsStr(S(function() return row.upgrades end)),
+                goodsStr(S(function() return row.averageProduction end))))
         end)
     end
     local an = findDT("/Game/NotStronghold/Data/DT_AnimsetWork.DT_AnimsetWork")
@@ -942,6 +974,49 @@ local function unitsSnapshot()
             end)
             c = S(function() return c:GetSuperStruct() end)
             if c and not S(function() return c:GetFullName():find("ManorLords", 1, true) end, false) then break end
+        end
+    end
+
+    -- Player's residential buildings: occupant slots from the building table next to the
+    -- families actually assigned to / living in each house (for the families-per-house feature)
+    do
+        local HOME_TYPES = { [3] = true, [8] = true, [60] = true, [484] = true }
+        local engine = getEngine()
+        local pawn = engine and getPlayerPawn(engine)
+        local pawnAddr = pawn and S(function() return pawn:GetAddress() end)
+        local bs = findDT("/Game/NotStronghold/Data/buildingStats.buildingStats")
+        table.insert(L, "")
+        table.insert(L, "== residential buildings (player) ==")
+        local n = 0
+        local regions, regionOrder = {}, {}
+        for _, b in ipairs(FindAllOf("SMBuildingMaster") or {}) do
+            if valid(b) then
+                local bType = S(function() return b.Data.bType end, -1)
+                local owner = S(function() return b.ownerPawn end)
+                local mine = not pawnAddr or (valid(owner) and owner:GetAddress() == pawnAddr)
+                local isHome = S(function() return b:isResidentialBuilding() end, false) or HOME_TYPES[bType]
+                if mine and isHome then
+                    local row = bs and S(function() return bs:FindRow(tostring(bType)) end)
+                    -- family IDs are numbered per region, so the region tells duplicates apart
+                    local reg = S(function() return b.Region end)
+                    local rname = valid(reg) and fstr(S(function() return reg.regionName end, "?")) or "?"
+                    if valid(reg) and not regions[rname] then regions[rname] = reg; table.insert(regionOrder, rname) end
+                    table.insert(L, string.format("HOME region=%s bType=%d built=%s tableOcc=%s occupants=[%s] assigned=[%s] upgradesDone=[%s]",
+                        rname, bType, tostring(S(function() return b.Data.constructed end, "?")),
+                        row and vec4Str(S(function() return row.occupantTypes end)) or "?",
+                        intsStr(S(function() return b.occupantFamilyIDs end)),
+                        intsStr(S(function() return b.assignedFamilyIDs end)),
+                        intsStr(S(function() return b.upgradesDone end))))
+                    n = n + 1
+                end
+            end
+        end
+        table.insert(L, string.format("(%d residential buildings)", n))
+        for _, rname in ipairs(regionOrder) do
+            local reg = regions[rname]
+            table.insert(L, string.format("REGION %s families=%s homeless=%s",
+                rname, tostring(S(function() return reg:getTotalNumFamilies() end, "?")),
+                tostring(S(function() return reg:getNumHomelessFamilies() end, "?"))))
         end
     end
 

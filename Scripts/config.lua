@@ -116,7 +116,18 @@ return {
         SoloBreeding            = false,
     },
 
-    -- 14. Perks: give one perk the effects of every other perk and strip its downsides
+    -- 14. Families per house (burgage plot)
+    --    How many families a house of each level holds. The house expansion - the upgrade
+    --    that adds a second dwelling to the plot, not a backyard extension - still adds one
+    --    more on top, as in vanilla. 0 = leave unchanged.
+    --    Vanilla: Lv1 = 1, Lv2 = 1, Lv3 = 2, Lv4 = 3.
+    --    Lowering a value later, or removing the mod, does not evict anyone: houses that
+    --    already hold more families keep them. The free housing counter then counts those
+    --    families as missing housing and can go negative until you build more houses, but
+    --    nobody is actually homeless and approval is not affected.
+    BurgageFamilies = { Lv1 = 0, Lv2 = 0, Lv3 = 0, Lv4 = 0 },
+
+    -- 15. Perks: give one perk the effects of every other perk and strip its downsides
     SuperPerk = {
         Enabled = false,
         NameMatch = { "Bamberg" },  -- perks whose name contains one of these strings
@@ -149,7 +160,7 @@ return {
         },
     },
 
-    -- 15. Bandits and raids
+    -- 16. Bandits and raids
     --    NOT VERIFIED: the in-game effect of these two was never confirmed, so they are off.
     --    Leave them as they are unless you want to experiment.
     MaxBanditCamps                = -1,  -- cap on bandit camps; fewer camps means fewer monthly

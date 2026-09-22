@@ -8,7 +8,7 @@ Tested on Manor Lords **0.8.104** (Steam) with UE4SS.
 
 Prefer no DLL at all? **MLTweaks Lite** is the same mod without the native part - see the
 optional files. It covers everything except crops, carrying, rich resources, free ox / animal
-orders and the wildlife population cap.
+orders, the wildlife population cap and families per house.
 
 ---
 
@@ -78,6 +78,11 @@ Each entry lists the setting name in `config.lua`.
   `MaxMultiplier` raises the population cap of a spot, and `SoloBreeding` lets a herd of one
   recover (vanilla needs two animals).
 
+### Housing
+- `BurgageFamilies` - how many families a house of each level holds (vanilla: level 1 and 2
+  one family, level 3 two, level 4 three). The house expansion that adds a second dwelling to
+  the plot still adds one more on top.
+
 ### Economy and other
 - `FreeOxen`, `FreeCows`, `FreeAnimalOrders` - make animal orders cost nothing. The regular
   price of an ox order is the import price plus a flat trade fee; this mod zeroes the cost of
@@ -139,11 +144,15 @@ The DLL's source is included in `native/src/` and it builds with `native/build.b
 Most of what the mod changes lives in memory and is gone when you remove the mod: data table
 values, game settings, production and storage multipliers.
 
-Three things are written into the save and stay after uninstalling:
+These are written into the save and stay after uninstalling:
 
 - Wild gathering spots keep the `capacity` you set them to.
 - Animal populations keep the size they grew to.
 - Resource nodes already flagged as rich stay rich.
+- Houses keep the extra families they took in through `BurgageFamilies`. Nobody is evicted,
+  but the free housing counter counts those families as missing housing, so it can show a
+  negative number until you build more houses. No family is actually homeless and approval
+  is not affected.
 
 None of these break a vanilla game - they just stay at the value they reached.
 
@@ -157,6 +166,9 @@ None of these break a vanilla game - they just stay at the value they reached.
   the mod keeps working.
 - **A crash right after loading a save** - set `SuperPerk.Enabled = false` first; adding perk
   effects is the most invasive thing this mod does.
+- **Free housing shows a negative number after lowering `BurgageFamilies`** - see *What stays
+  in your save*: houses keep families they already took in, and the counter treats the extra
+  ones as missing housing. Building more houses brings it back up.
 - **Changed a value and nothing happened** - the game has to be restarted; hot reload is not
   supported.
 
