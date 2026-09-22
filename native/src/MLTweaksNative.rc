@@ -2,8 +2,8 @@
 #include <winver.h>
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION     1,1,0,0
- PRODUCTVERSION  1,1,0,0
+ FILEVERSION     1,2,0,0
+ PRODUCTVERSION  1,2,0,0
  FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
  FILEFLAGS       0x0L
  FILEOS          VOS_NT_WINDOWS32
@@ -16,12 +16,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "miu0007"
             VALUE "FileDescription",  "MLTweaks native patches for Manor Lords (UE4SS mod)"
-            VALUE "FileVersion",      "1.1.0.0"
+            VALUE "FileVersion",      "1.2.0.0"
             VALUE "InternalName",     "MLTweaksNative"
             VALUE "LegalCopyright",   "Free to use, modify and redistribute"
             VALUE "OriginalFilename", "MLTweaksNative.dll"
             VALUE "ProductName",      "MLTweaks"
-            VALUE "ProductVersion",   "1.1.0.0"
+            VALUE "ProductVersion",   "1.2.0.0"
             VALUE "Comments",         "Source: https://github.com/miu0007/LM-Tweaks"
         END
     END

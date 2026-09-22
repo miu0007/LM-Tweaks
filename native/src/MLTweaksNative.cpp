@@ -14,7 +14,7 @@
 namespace {
 
 const char* kModDir = "ue4ss\\Mods\\MLTweaks\\";
-const char* kVersion = "1.2.0-dev";
+const char* kVersion = "1.2.0";
 
 FILE* g_log = nullptr;
 

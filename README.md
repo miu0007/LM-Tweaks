@@ -1,4 +1,4 @@
-# MLTweaks 1.1.0
+# MLTweaks 1.2.0
 
 A configurable tweak mod for **Manor Lords**. One settings file lets you scale production,
 storage, carrying, crops, wildlife and more. Out of the box it changes **nothing** - every
@@ -181,6 +181,20 @@ None of these break a vanilla game - they just stay at the value they reached.
   supported.
 
 ## Changelog
+
+**1.2.0**
+- New: `BurgageFamilies` - how many families a house of each level holds.
+- Fixed: `TreeGrowthRate` had no effect. The game never reads its own "tree growth rate" game
+  setting, which is what 1.1.0 changed. The setting now speeds up the growth of saplings
+  planted by foresters directly (full version only; not available in Lite). A save that used
+  the 1.1.0 setting keeps that unused value, which is harmless.
+- Removed: `FreeCows`. The livestock trading post price does not follow the value it changed.
+  An old `config.lua` that still has the line keeps working; the line is ignored.
+- `MilitiaSquadMaxSize`: documented when the new size applies (new squads, and squads without
+  men when another squad is formed).
+- Checked in game: archer range and archer damage with war bows and crossbows, the militia cap,
+  the mining multiplier, the free-ox hotkey. The *Not fully tested* list is shorter.
+- `report.txt` gets `check:` lines that show what was applied, to make reports easier.
 
 **1.1.0**
 - The DLL is no longer loaded unless a setting needs it. With the default settings the mod now
