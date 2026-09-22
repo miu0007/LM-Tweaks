@@ -71,7 +71,8 @@ return {
     MaxMilitiaSquads              = 0,   -- number of militia squads (game default 6). 0 = leave unchanged
     MilitiaSquadMaxSize           = 0,   -- men per militia squad. 0 = leave unchanged
 
-    -- 9. Tree growth rate (the game setting itself, default 1.0). 0 = leave unchanged
+    -- 9. Growth speed of saplings planted by foresters. 2 = twice as fast. 0 = leave unchanged
+    --    (vanilla: the first growth stage alone takes about 250 days)
     TreeGrowthRate                = 0,
 
     -- 10. Treat every resource node and mineral deposit as a rich one
@@ -79,7 +80,6 @@ return {
 
     -- 11. Free livestock
     FreeOxen                      = false, -- the monthly "order oxen" costs nothing
-    FreeCows                      = false, -- also make cows free (this drops their sale value to 0 as well)
     -- Other animal orders to make free (oxen = 13 is covered by FreeOxen above)
     --   19 = horse, 21 = mule, 26 = hunting hound, 27 = pig, 28 = goat
     FreeAnimalOrders              = {},
@@ -165,6 +165,7 @@ return {
     --    Leave them as they are unless you want to experiment.
     MaxBanditCamps                = -1,  -- cap on bandit camps; fewer camps means fewer monthly
                                          -- thefts (0 = no new camps). -1 = leave unchanged
+                                         -- (stored in your save; set 3 to restore the default)
     RaidIntervalMultiplier        = 1.0, -- 2 = twice as long between raids, 0.5 = half as long
 
     -- Debug hotkeys

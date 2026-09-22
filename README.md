@@ -8,7 +8,7 @@ Tested on Manor Lords **0.8.104** (Steam) with UE4SS.
 
 Prefer no DLL at all? **MLTweaks Lite** is the same mod without the native part - see the
 optional files. It covers everything except crops, carrying, rich resources, free ox / animal
-orders, the wildlife population cap and families per house.
+orders, the wildlife population cap, families per house and tree growth.
 
 ---
 
@@ -84,13 +84,17 @@ Each entry lists the setting name in `config.lua`.
   the plot still adds one more on top.
 
 ### Economy and other
-- `FreeOxen`, `FreeCows`, `FreeAnimalOrders` - make animal orders cost nothing. The regular
+- `FreeOxen`, `FreeAnimalOrders` - make animal orders cost nothing. The regular
   price of an ox order is the import price plus a flat trade fee; this mod zeroes the cost of
   the selected orders only, so ordinary trade prices are untouched.
 - `SuperPerk` - gives one perk (matched by name) the effects of every other perk and removes
   the ones that are downsides.
 - `MaxMilitiaSquads`, `MilitiaSquadMaxSize`, `ArcherDamageMultiplier`, `ArcherRangeMultiplier`,
   `TreeGrowthRate`, `MaxBanditCamps`, `RaidIntervalMultiplier`.
+- `TreeGrowthRate` - how fast saplings planted by foresters grow into trees (`2` = twice as
+  fast). In vanilla the first growth stage alone takes about 250 days. The game has a
+  "tree growth rate" in its own game setup, but the game never reads it, so this mod changes
+  the growth step itself instead.
 
 ### Debug
 - `DebugHotkeys` - `Ctrl+Shift+U` dumps villagers and their inventory to `units_snapshot.txt`,
@@ -104,12 +108,10 @@ Each entry lists the setting name in `config.lua`.
 
 These are implemented but their in-game effect was never confirmed. They are off by default.
 
-- Archer damage and range
-- Militia squad cap and squad size
-- Tree growth rate
-- Mining multiplier (the log shows the extra amount being added; the effect on stock was not measured)
+- Archer damage for archers whose base ranged attack is 0 (the multiplier has nothing to scale).
+  Range, and damage with war bows and crossbows, were checked.
+- Militia squad size (the squad cap was checked)
 - Bandit camp cap and raid interval
-- Free cows, and the free-ox hotkey
 
 Everything else in the list above was checked in game.
 
@@ -142,13 +144,17 @@ The DLL's source is included in `native/src/` and it builds with `native/build.b
 ## What stays in your save
 
 Most of what the mod changes lives in memory and is gone when you remove the mod: data table
-values, game settings, production and storage multipliers.
+values, most game settings, production and storage multipliers.
 
 These are written into the save and stay after uninstalling:
 
 - Wild gathering spots keep the `capacity` you set them to.
 - Animal populations keep the size they grew to.
 - Resource nodes already flagged as rich stay rich.
+- `MaxBanditCamps`: the game setup is part of the save, so the last value stays.
+  Setting it back to `-1` ("leave unchanged") does not undo it; set `3` (the game default).
+  (MLTweaks 1.1.0 also wrote `TreeGrowthRate` there; the game never reads that value, so it is
+  harmless.)
 - Houses keep the extra families they took in through `BurgageFamilies`. Nobody is evicted,
   but the free housing counter counts those families as missing housing, so it can show a
   negative number until you build more houses. No family is actually homeless and approval

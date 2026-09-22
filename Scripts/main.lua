@@ -60,6 +60,7 @@ local function nativeNeeded()
         or (cfg.HandCarryAmount or 0) > 1 or (cfg.CartCarryAmount or 0) > 1
         or cfg.FreeOxen or #(cfg.FreeAnimalOrders or {}) > 0
         or wl.SoloBreeding or (wl.MaxMultiplier or 1) > 1
+        or ((cfg.TreeGrowthRate or 0) > 0 and cfg.TreeGrowthRate ~= 1)
         or familiesSet()) and true or false
 end
 
@@ -93,6 +94,9 @@ local function loadNativePatches()
     f:write("WildlifeMax=" .. tostring(math.floor(wl.MaxMultiplier or 1)) .. "\n")
     local bf = cfg.BurgageFamilies or {}
     for lv = 1, 4 do f:write(string.format("FamiliesLv%d=%d\n", lv, math.floor(bf["Lv" .. lv] or 0))) end
+    -- sapling growth speed (the game's own treeGrowthRate setting is never read by the game)
+    local tg = cfg.TreeGrowthRate or 0
+    f:write(string.format("TreeGrowth=%.3f\n", tg > 0 and tg or 1))
     f:close()
     if not nativeNeeded() then
         log("native: no setting needs MLTweaksNative.dll - not loaded")
@@ -102,7 +106,7 @@ local function loadNativePatches()
     local probe = io.open(dll, "rb")
     if not probe then
         log("native: MLTweaksNative.dll not found (Lite package?) - crop, carrying, rich resource,")
-        log("        free animal order, herd cap and families per house settings are ignored")
+        log("        free animal order, herd cap, families per house and tree growth settings are ignored")
         return
     end
     probe:close()
@@ -176,6 +180,17 @@ local function applyTracked(obj, field, mult, key, isInt, square)
         return true
     end
     return false
+end
+
+-- Verification log: at most 5 lines per kind, so a value the game keeps resetting shows up
+-- without flooding report.txt.
+local checkCount = {}
+local function checkLog(kind, msg)
+    local n = (checkCount[kind] or 0) + 1
+    checkCount[kind] = n
+    if n <= 5 then log("check: " .. msg) end
+    if n == 5 then log("check: further '" .. kind .. "' lines suppressed") end
+    if n <= 5 then flushReport() end
 end
 
 local function restoreTracked(obj, field, key, square)
@@ -473,6 +488,15 @@ tasks.superPerk = function()
 end
 
 -- 6b. Militia squad size
+-- The template only seeds new squads; every existing squad keeps its own maxSize
+-- (RTSMultiEngineCPP.squads), which liveTick raises for the player's militia squads.
+local militiaTypes = {}   -- DT_UnitTemplates row names with isMilitia
+
+local function nameStr(x)
+    if type(x) == "string" then return x end
+    return S(function() return x:ToString() end, tostring(x))
+end
+
 tasks.militiaSize = function()
     local size = cfg.MilitiaSquadMaxSize or 0
     if size <= 0 then return true end
@@ -482,6 +506,7 @@ tasks.militiaSize = function()
     dt:ForEachRow(function(rowName, row)
         if S(function() return row.isMilitia end, false) then
             pcall(function() row.maxSize = size end); n = n + 1
+            militiaTypes[nameStr(rowName)] = true
         end
     end)
     log(string.format("militia squad size: %d templates -> %d", n, size))
@@ -558,7 +583,7 @@ tasks.freeOxen = function()
     return true
 end
 
--- 9b. Livestock price: set the item value of oxen (and optionally cows) to 0.
+-- 9b. Livestock price: set the item value of oxen to 0.
 -- Region:getLivestockPrice is logged before/after so the effect can be verified.
 local LIVESTOCK_ITEMS = { Ox = 234, Cow = 347, Horse = 98, Mule = 306 }
 
@@ -576,13 +601,12 @@ local function logLivestockPrices(tag)
 end
 
 tasks.freeLivestock = function()
-    if not cfg.FreeOxen and not cfg.FreeCows then return true end
+    if not cfg.FreeOxen then return true end
     local dt = findDT("/Game/NotStronghold/Data/DT_Items.DT_Items")
     if not dt then return false end
     if not logLivestockPrices("before") then return false end -- wait until a game is loaded
     local ids = {}
     if cfg.FreeOxen then table.insert(ids, LIVESTOCK_ITEMS.Ox) end
-    if cfg.FreeCows then table.insert(ids, LIVESTOCK_ITEMS.Cow) end
     for _, id in ipairs(ids) do
         local row = S(function() return dt:FindRow(tostring(id)) end)
         if row then pcall(function() row.Value = 0 end) end
@@ -646,27 +670,25 @@ local function liveTick()
 
     -- 6. militia cap
     if pawn and (cfg.MaxMilitiaSquads or 0) > 0 then
-        if S(function() return pawn.maxNumOfMilitiaToSpawn end, -1) ~= cfg.MaxMilitiaSquads then
+        local cur = S(function() return pawn.maxNumOfMilitiaToSpawn end, -1)
+        if cur ~= cfg.MaxMilitiaSquads then
             pcall(function() pawn.maxNumOfMilitiaToSpawn = cfg.MaxMilitiaSquads end)
+            local now = S(function() return pawn.maxNumOfMilitiaToSpawn end, -1)
+            checkLog("militia", string.format("militia cap: %d -> %d", cur, now))
         end
     end
 
-    -- 7. tree growth rate (game setup parameter)
-    if (cfg.TreeGrowthRate or 0) > 0 then
-        local gi = FindFirstOf("MLGameInstance")
-        if valid(gi) then
-            local cur = S(function() return gi.gameSetup.currentGameSetup.treeGrowthRate end)
-            if type(cur) == "number" and math.abs(cur - cfg.TreeGrowthRate) > 1e-4 then
-                pcall(function() gi.gameSetup.currentGameSetup.treeGrowthRate = cfg.TreeGrowthRate end)
-            end
-        end
-    end
+    -- 7. tree growth rate: applied by the DLL (TreeGrowth in native.cfg). The game setup value
+    --    treeGrowthRate is saved but never read, so it is left alone.
 
     -- 11. bandit camp cap (thefts are done monthly by encamped bandit squads)
     if (cfg.MaxBanditCamps or -1) >= 0 then
         local gi = FindFirstOf("MLGameInstance")
         if valid(gi) then
             local cur = S(function() return gi.gameSetup.currentGameSetup.maxBanditCamps end)
+            if (checkCount.banditSeen or 0) == 0 then
+                checkLog("banditSeen", "max bandit camps on first read: " .. tostring(cur))
+            end
             if type(cur) == "number" and cur ~= cfg.MaxBanditCamps then
                 pcall(function() gi.gameSetup.currentGameSetup.maxBanditCamps = cfg.MaxBanditCamps end)
                 log(string.format("max bandit camps: %d -> %d", cur, cfg.MaxBanditCamps))
@@ -706,6 +728,37 @@ local function liveTick()
         for i = 1, arrLen(cs) do playerSquads[S(function() return cs[i] end, -1)] = true end
     end
 
+    -- 6b. militia squad size of the player's existing squads
+    local squadSize = cfg.MilitiaSquadMaxSize or 0
+    if squadSize > 0 and next(militiaTypes) then
+        -- militia squads that are not called up are missing from commandedSquads; the squad
+        -- cards (playersSquadsUIOrder) list all of the player's squads
+        local mine = {}
+        for id in pairs(playerSquads) do mine[id] = true end
+        local ui = S(function() return engine.playersSquadsUIOrder end)
+        for i = 1, arrLen(ui) do mine[S(function() return ui[i] end, -1)] = true end
+        if (checkCount.squadList or 0) == 0 then
+            checkLog("squadList", "player squads: commanded [" .. intsStr(S(function() return pawn.commandedSquads end)) ..
+                "] cards [" .. intsStr(ui) .. "]")
+        end
+        local sqs = S(function() return engine.squads end)
+        for i = 1, arrLen(sqs) do
+            local s = S(function() return sqs[i] end)
+            local id = s and S(function() return s.ID end, -1) or -1
+            if mine[id] then
+                local ut = nameStr(S(function() return s.unitType end, ""))
+                local cur = S(function() return s.maxSize end, -1)
+                if militiaTypes[ut] and cur ~= squadSize then
+                    pcall(function() s.maxSize = squadSize end)
+                    checkLog("squadSize", string.format("squad %d (%s): maxSize %d -> %d",
+                        id, ut, cur, S(function() return s.maxSize end, -1)))
+                elseif not militiaTypes[ut] then
+                    checkLog("squadSkip", string.format("squad %d (%s): not militia, maxSize %d", id, ut, cur))
+                end
+            end
+        end
+    end
+
     -- 4a / 5. units
     local wm = cfg.VillagerWalkSpeedMultiplier or 1
     local am = cfg.AnimalWalkSpeedMultiplier or 1
@@ -728,7 +781,16 @@ local function liveTick()
                 if playerSquads[sq] and sr > 0 then
                     local a = applyTracked(u, "rangedAtt", dm, addr .. "|rangedAtt")
                     local b = applyTracked(u, "shootingRange", rm, addr .. "|shootingRange", false, "shootingRangeSq")
-                    if a or b then st.archer = st.archer + 1 end
+                    if a or b then
+                        st.archer = st.archer + 1
+                        if not st.archerSample then
+                            local ta, tr = tracked[addr .. "|rangedAtt"], tracked[addr .. "|shootingRange"]
+                            st.archerSample = string.format("squad %s: rangedAtt %s -> %s, shootingRange %s -> %s (now %s)",
+                                tostring(sq), tostring(ta and ta.base), tostring(ta and ta.set),
+                                tostring(tr and tr.base), tostring(tr and tr.set),
+                                tostring(S(function() return u.shootingRange end, "?")))
+                        end
+                    end
                 end
             end
         end
@@ -769,16 +831,26 @@ local function liveTick()
                             local key = baddr .. "|" .. t
                             local ms = miningState[key]
                             if not ms and miningSeen[baddr] then ms = { last = 0, frac = 0 } end
+                            if ms and cur < ms.last and ms.added then
+                                -- stock went down after we added: carried away, or the game undid our write
+                                checkLog("miningDrop", string.format("mining: building %d good %d amt %d -> %d right after +%d",
+                                    bType, t, ms.last, cur, ms.added))
+                            end
+                            local added = nil
                             if ms and cur > ms.last then
                                 local want = (cur - ms.last) * (m - 1) + ms.frac
                                 local extra = math.floor(want)
                                 ms.frac = want - extra
+                                local before = cur
                                 if extra > 0 and pcall(function() g.amt = cur + extra end) then
-                                    cur = cur + extra
+                                    cur = S(function() return g.amt end, cur + extra)
                                     st.mined = (st.mined or 0) + extra
+                                    added = extra
+                                    checkLog("mining", string.format("mining: building %d good %d amt %d -> %d (mined %d, added %d)",
+                                        bType, t, ms.last, cur, before - ms.last, extra))
                                 end
                             end
-                            miningState[key] = { last = cur, frac = ms and ms.frac or 0 }
+                            miningState[key] = { last = cur, frac = ms and ms.frac or 0, added = added }
                         end
                     end
                     miningSeen[baddr] = true
@@ -847,6 +919,7 @@ local function liveTick()
     if st.walk + st.archer + st.storage + st.deposit + st.mined + st.wildCap + st.wildFill > 0 then
         log(string.format("live: walkSpeed=%d archers=%d storage=%d deposits=%d mined+%d wildCap=%d wild+%d",
             st.walk, st.archer, st.storage, st.deposit, st.mined, st.wildCap, st.wildFill))
+        if st.archerSample then checkLog("archer", "archer sample: " .. st.archerSample) end
         flushReport()
     end
 end
@@ -1033,6 +1106,8 @@ if cfg.FreeOxHotkey then
             if cm then
                 local ok, err = pcall(function() cm:spawnOxen(1) end)
                 log(ok and "free ox spawned" or ("spawnOxen failed: " .. tostring(err)))
+            else
+                log("spawnOxen: cheat manager not found")
             end
             flushReport()
         end)

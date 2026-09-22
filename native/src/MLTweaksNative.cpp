@@ -542,6 +542,57 @@ bool InstallWildlifeCapHook(uint8_t* text, size_t textSize)
 }
 
 // ---------------------------------------------------------------------------
+// TreeGrowth: saplings planted by foresters are kept in Region's growing-foliage list
+// (Region+0xFA0, 0x80 bytes each: component, transform, LastGrowthDay at +0x70). The region
+// updates one entry per call and grows its scale by
+//     scale += (today - LastGrowthDay) * 0.03375
+// moving it to the next young-tree mesh / a grown tree once the scale passes a threshold
+// (vanilla: about 250-270 days from planting to a grown tree). The game setup value
+// GameSetupParameters.treeGrowthRate is never read by this code.
+// The patch keeps the instruction "mulss xmm6, [rip+disp32]" and only points its disp32 at
+// our own read-only copy of the constant, multiplied. Nothing else uses that constant.
+// ---------------------------------------------------------------------------
+const char* kTreeGrowthSig =
+    "66 0F 6E F0 0F 5B F6 F3 0F 59 35 ?? ?? ?? ?? F3 0F 58 F0 0F 10 46 30 0F 11 44 24 60";
+const int kTreeGrowthMulss = 7;   // offset of "F3 0F 59 35 disp32" in the signature
+const float kTreeGrowthVanilla = 0.03375f;
+float g_treeGrowthMul = 1.0f;
+
+bool InstallTreeGrowthPatch(uint8_t* text, size_t textSize)
+{
+    std::vector<int> sig;
+    ParseHex(kTreeGrowthSig, sig);
+    auto hits = FindAll(text, textSize, sig);
+    if (hits.size() != 1) {
+        Log("[TreeGrowth] sapling growth: signature found %zu times - SKIPPED", hits.size());
+        return false;
+    }
+    uint8_t* site = hits[0] + kTreeGrowthMulss;
+    uint8_t* next = site + 8;
+    const float* orig = reinterpret_cast<const float*>(next + *reinterpret_cast<int32_t*>(site + 4));
+    if (*orig < kTreeGrowthVanilla - 1e-6f || *orig > kTreeGrowthVanilla + 1e-6f) {
+        Log("[TreeGrowth] unexpected growth constant %f - SKIPPED", *orig);
+        return false;
+    }
+    uint8_t* mem = AllocNear(site, 16);
+    if (!mem) { Log("[TreeGrowth] could not allocate near memory"); return false; }
+    const float value = *orig * g_treeGrowthMul;
+    memcpy(mem, &value, sizeof(value));
+    DWORD old;
+    if (!VirtualProtect(mem, 16, PAGE_READONLY, &old)) { Log("[TreeGrowth] VirtualProtect failed"); return false; }
+
+    int64_t rel = reinterpret_cast<int64_t>(mem) - reinterpret_cast<int64_t>(next);
+    if (rel > INT32_MAX || rel < INT32_MIN) { Log("[TreeGrowth] constant out of range"); return false; }
+    std::vector<int> patch;
+    for (int i = 0; i < 4; ++i) patch.push_back(static_cast<int>((static_cast<uint32_t>(rel) >> (8 * i)) & 0xFF));
+    if (!WriteCode(site + 4, patch)) { Log("[TreeGrowth] VirtualProtect failed"); return false; }
+    Log("[TreeGrowth] sapling growth per day %.5f -> %.5f (x%.2f) at exe+0x%llX",
+        *orig, value, g_treeGrowthMul,
+        static_cast<unsigned long long>(site - reinterpret_cast<uint8_t*>(GetModuleHandleA(nullptr))));
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // BurgageFamilies: how many families a house holds. The building table is NOT used for this
 // (buildingStats.occupantTypes.Y is ignored); two small functions compute it:
 //   SMBuildingMaster::getFamilyCapacity()            8 callers: living space, homeless
@@ -867,6 +918,12 @@ void ApplyPatches()
     g_wildlifeMax = ConfigInt(cfg, "WildlifeMax", 1);
     if (g_wildlifeMax > 1 && g_wildlifeMax <= 1000) InstallWildlifeCapHook(text, textSize);
     else Log("[WildlifeMax] disabled");
+
+    // TreeGrowth=F : growth speed multiplier for saplings planted by foresters
+    g_treeGrowthMul = ConfigFloat(cfg, "TreeGrowth", 1.0f);
+    if (g_treeGrowthMul > 0.0f && g_treeGrowthMul != 1.0f && g_treeGrowthMul <= 1000.0f)
+        InstallTreeGrowthPatch(text, textSize);
+    else Log("[TreeGrowth] disabled");
 
     // FamiliesLvN=M : base families per house of level N (0 = vanilla)
     {
