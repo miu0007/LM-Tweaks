@@ -8,7 +8,8 @@
 -- ============================================================
 return {
 
-    -- 1. Output per production cycle
+    -- 1. Output per production cycle, in YOUR OWN buildings (an AI lord's workshops keep
+    --    vanilla output). In Lite, without the DLL, it applies to every settlement.
     FoodProductionMultiplier      = 1.0,   -- food (bread, meat, cheese, ale, ...)
     ProcessedGoodsMultiplier      = 1.0,   -- everything else crafted (planks, cloth, tools, weapons, ...)
 

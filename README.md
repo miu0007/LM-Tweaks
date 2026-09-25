@@ -49,7 +49,9 @@ Edit `Scripts/config.lua` and **restart the game**.
 Each entry lists the setting name in `config.lua`.
 
 ### Production and crops
-- `FoodProductionMultiplier`, `ProcessedGoodsMultiplier` - output per production cycle.
+- `FoodProductionMultiplier`, `ProcessedGoodsMultiplier` - output per production cycle, in your
+  own buildings only. The inputs a craft consumes are unchanged. Lite, which has no DLL, can
+  only change the item table, so there it applies to every settlement.
 - `CropYieldMultiplier`, `CropGrowthMultiplier` - per crop group (grains / vegetables / fruits).
   Both apply to your own fields only; an AI lord's fields keep vanilla values.
 - `HarvestAnytime` - harvest outside the autumn window.

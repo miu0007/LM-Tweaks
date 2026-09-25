@@ -49,6 +49,8 @@ local function familiesSet()
     return false
 end
 
+local nativeActive = false   -- true once MLTweaksNative.dll is up
+
 local function nativeNeeded()
     local ym, gm = cfg.CropYieldMultiplier or {}, cfg.CropGrowthMultiplier or {}
     for _, g in ipairs({ "Grains", "Vegetables", "Fruits" }) do
@@ -61,6 +63,7 @@ local function nativeNeeded()
         or cfg.FreeOxen or #(cfg.FreeAnimalOrders or {}) > 0
         or wl.SoloBreeding or (wl.MaxMultiplier or 1) > 1
         or ((cfg.TreeGrowthRate or 0) > 0 and cfg.TreeGrowthRate ~= 1)
+        or (cfg.FoodProductionMultiplier or 1) ~= 1 or (cfg.ProcessedGoodsMultiplier or 1) ~= 1
         or (cfg.ImmigrationMultiplier or 1) > 1
         or familiesSet()) and true or false
 end
@@ -100,6 +103,9 @@ local function loadNativePatches()
     f:write(string.format("TreeGrowth=%.3f\n", tg > 0 and tg or 1))
     -- families moving into the player's region each month
     f:write(string.format("Immigration=%.3f\n", cfg.ImmigrationMultiplier or 1))
+    -- workshop output of the player's own buildings (the DLL scales it per building)
+    f:write(string.format("ProdMulFood=%.3f\n", cfg.FoodProductionMultiplier or 1))
+    f:write(string.format("ProdMulOther=%.3f\n", cfg.ProcessedGoodsMultiplier or 1))
     f:close()
     if not nativeNeeded() then
         log("native: no setting needs MLTweaksNative.dll - not loaded")
@@ -118,6 +124,7 @@ local function loadNativePatches()
     if not init then log("native: failed to load DLL: " .. tostring(err)); return end
     local ok, e = pcall(init)
     if ok then
+        nativeActive = true
         log("native: MLTweaksNative.dll loaded (see native_log.txt)")
     else
         log("native: MLTweaks_Init failed: " .. tostring(e))
@@ -321,6 +328,36 @@ tasks.production = function()
     local dt = findDT("/Game/NotStronghold/Data/DT_Items.DT_Items")
     if not dt then return false end
     local cats = itemCategoryMap(dt)
+
+    -- With the DLL the output is scaled per building, so an AI lord's workshops keep vanilla
+    -- values and the item table is left alone. The DLL only needs to know which building types
+    -- make food; that comes from the building table, which exists only once a game is loaded.
+    if nativeActive then
+        local bs = findDT("/Game/NotStronghold/Data/buildingStats.buildingStats")
+        if not bs then return false end
+        local foodTypes = {}
+        bs:ForEachRow(function(rowName, row)
+            local id = tonumber(tostring(rowName))
+            if not id then return end
+            local prod = S(function() return row.averageProduction end)
+            for i = 1, arrLen(prod) do
+                local t = S(function() return prod[i].Type end, 0)
+                if (cats[tostring(t)] or 0) == EItemCategory_Food then foodTypes[id] = true end
+            end
+        end)
+        local list = {}
+        for id in pairs(foodTypes) do table.insert(list, id) end
+        table.sort(list)
+        local f = io.open(MOD_DIR .. "native_runtime.cfg", "w")
+        if not f then log("production: cannot write native_runtime.cfg"); return true end
+        f:write("FoodBuildings=" .. table.concat(list, ",") .. "\n")
+        f:close()
+        log(string.format("production: handed %d food building types to the DLL (food x%.2f, other x%.2f)",
+            #list, fm, pm))
+        return true
+    end
+
+    -- Lite (no DLL): the item table is the only lever, and it applies to everyone
     local nFood, nProc = 0, 0
     dt:ForEachRow(function(rowName, row)
         local outs = S(function() return row.craftingOutput end)

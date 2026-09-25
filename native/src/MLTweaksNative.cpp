@@ -692,6 +692,74 @@ bool InstallImmigrationHook(uint8_t* text, size_t textSize)
 }
 
 // ---------------------------------------------------------------------------
+// Production output, for the player's buildings only. When a craft finishes, the game asks
+// the building how many units this one produced: normally 1, 2 on the bonus craft a yield
+// perk grants, 0 on a botched one (SMBuildingMaster::<units produced>, the function that
+// reads GetSummedYieldModifierValue). Scaling that result multiplies the output while the
+// inputs, which are consumed per craft, stay the same - the same effect the Lua side used to
+// get by editing the item table, but without touching an AI lord's workshops.
+// Whether a building makes food or crafted goods comes from the game's building table, which
+// only exists once a game is loaded, so Lua writes the list to native_runtime.cfg and a small
+// thread here picks it up. Until it arrives, output is left at vanilla.
+// ---------------------------------------------------------------------------
+const char* kCraftCountSig =
+    "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 40 0F 29 74 24 30 48 8B F1 0F 29 7C 24 20 E8";
+const int kCraftCountStolen = 15;
+
+using CraftCountFn = int(__fastcall*)(void*);
+CraftCountFn g_origCraftCount = nullptr;
+float g_prodMulFood = 1.0f, g_prodMulOther = 1.0f;
+bool g_prodFoodBuilding[512] = {};
+volatile LONG g_prodListReady = 0;
+
+int __fastcall CraftCountHook(void* b)
+{
+    int v = g_origCraftCount(b);
+    if (v <= 0 || !g_prodListReady || !IsPlayerBuilding(b)) return v;
+    int t = BuildingType(static_cast<uint8_t*>(b));
+    float m = (t >= 0 && t < 512 && g_prodFoodBuilding[t]) ? g_prodMulFood : g_prodMulOther;
+    if (m <= 1.0f) return v;
+    int scaled = static_cast<int>(v * m + 0.5f);
+    return scaled < v ? v : scaled;
+}
+
+// Waits for the building list Lua writes once the game's data tables are up.
+DWORD WINAPI ProdListThread(LPVOID)
+{
+    const std::string path = std::string(kModDir) + "native_runtime.cfg";
+    for (int i = 0; i < 1200; ++i) {          // up to ten minutes
+        Sleep(500);
+        FILE* f = nullptr;
+        if (fopen_s(&f, path.c_str(), "rb") != 0 || !f) continue;
+        std::string text;
+        char buf[512];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, n);
+        fclose(f);
+        const char* key = "FoodBuildings=";
+        size_t pos = text.find(key);
+        if (pos == std::string::npos) continue;
+        size_t end = text.find_first_of("\r\n", pos);
+        std::string list = text.substr(pos + strlen(key), end == std::string::npos ? std::string::npos : end - pos - strlen(key));
+        int count = 0;
+        const char* p = list.c_str();
+        while (*p) {
+            char* e = nullptr;
+            long v = strtol(p, &e, 10);
+            if (e == p) { ++p; continue; }
+            if (v >= 0 && v < 512) { g_prodFoodBuilding[v] = true; ++count; }
+            p = e;
+        }
+        InterlockedExchange(&g_prodListReady, 1);
+        Log("[Production] food buildings from native_runtime.cfg: %d types (food x%.2f, other x%.2f)",
+            count, g_prodMulFood, g_prodMulOther);
+        return 0;
+    }
+    Log("[Production] native_runtime.cfg never appeared - output left at vanilla");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // BurgageFamilies: how many families a house holds. The building table is NOT used for this
 // (buildingStats.occupantTypes.Y is ignored); two small functions compute it:
 //   SMBuildingMaster::getFamilyCapacity()            8 callers: living space, homeless
@@ -924,6 +992,24 @@ uint8_t* DetourFunctionNear(uint8_t* target, void* hook, int stolen, const char*
     return tramp;
 }
 
+bool InstallProductionHook(uint8_t* text, size_t textSize)
+{
+    std::vector<int> sig;
+    ParseHex(kCraftCountSig, sig);
+    auto hits = FindAll(text, textSize, sig);
+    if (hits.size() != 1) {
+        Log("[Production] units produced: signature found %zu times - SKIPPED", hits.size());
+        return false;
+    }
+    g_origCraftCount = reinterpret_cast<CraftCountFn>(
+        DetourFunction(hits[0], &CraftCountHook, kCraftCountStolen, "[Production]"));
+    if (!g_origCraftCount) return false;
+    Log("[Production] units produced per craft hooked at exe+0x%llX (player buildings only)",
+        static_cast<unsigned long long>(hits[0] - reinterpret_cast<uint8_t*>(GetModuleHandleA(nullptr))));
+    CloseHandle(CreateThread(nullptr, 0, ProdListThread, nullptr, 0, nullptr));
+    return true;
+}
+
 // The growth site is the start of getDailyPlantGrowth itself (see kCropSettingsGetterSig).
 bool InstallCropHooks(uint8_t* text, size_t textSize, uint8_t* growthFn)
 {
@@ -1146,6 +1232,14 @@ void ApplyPatches()
     g_wildlifeMax = ConfigInt(cfg, "WildlifeMax", 1);
     if (g_wildlifeMax > 1 && g_wildlifeMax <= 1000) InstallWildlifeCapHook(text, textSize);
     else Log("[WildlifeMax] disabled");
+
+    // ProdMulFood / ProdMulOther=F : output multipliers for the player's own workshops
+    g_prodMulFood = ConfigFloat(cfg, "ProdMulFood", 1.0f);
+    g_prodMulOther = ConfigFloat(cfg, "ProdMulOther", 1.0f);
+    if ((g_prodMulFood > 1.0f || g_prodMulOther > 1.0f) &&
+        g_prodMulFood <= 1000.0f && g_prodMulOther <= 1000.0f)
+        InstallProductionHook(text, textSize);
+    else Log("[Production] disabled");
 
     // Immigration=F : multiplier for the families that move into the player's region
     g_immigrationMul = ConfigFloat(cfg, "Immigration", 1.0f);
