@@ -74,6 +74,11 @@ return {
     MilitiaSquadMaxSize           = 0,   -- men per militia squad. 0 = leave unchanged
                                          -- (new squads; a squad with men keeps its size)
 
+    -- 9a. Backyard animals on YOUR burgage plots: how much faster chickens, goats and pigs
+    --    hand in eggs, milk and pork. 2 = twice as often. Vanilla waits are 15 days for eggs,
+    --    49 for milk and 73 for pork; the amount per delivery is unchanged. 1 = leave unchanged
+    BackyardAnimalMultiplier      = 1.0,
+
     -- 9b. How many families move into YOUR region every month (the game's own monthly
     --    population growth, with its approval and free housing modifiers). 2 = twice as many.
     --    Arrivals come one a day at most, so a month tops out at about 30 families.

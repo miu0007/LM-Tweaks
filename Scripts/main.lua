@@ -64,7 +64,7 @@ local function nativeNeeded()
         or wl.SoloBreeding or (wl.MaxMultiplier or 1) > 1
         or ((cfg.TreeGrowthRate or 0) > 0 and cfg.TreeGrowthRate ~= 1)
         or (cfg.FoodProductionMultiplier or 1) ~= 1 or (cfg.ProcessedGoodsMultiplier or 1) ~= 1
-        or (cfg.ImmigrationMultiplier or 1) > 1
+        or (cfg.ImmigrationMultiplier or 1) > 1 or (cfg.BackyardAnimalMultiplier or 1) > 1
         or familiesSet()) and true or false
 end
 
@@ -103,6 +103,8 @@ local function loadNativePatches()
     f:write(string.format("TreeGrowth=%.3f\n", tg > 0 and tg or 1))
     -- families moving into the player's region each month
     f:write(string.format("Immigration=%.3f\n", cfg.ImmigrationMultiplier or 1))
+    -- backyard animals (eggs, milk, pork) of the player's own plots
+    f:write(string.format("Backyard=%.3f\n", cfg.BackyardAnimalMultiplier or 1))
     -- workshop output of the player's own buildings (the DLL scales it per building)
     f:write(string.format("ProdMulFood=%.3f\n", cfg.FoodProductionMultiplier or 1))
     f:write(string.format("ProdMulOther=%.3f\n", cfg.ProcessedGoodsMultiplier or 1))

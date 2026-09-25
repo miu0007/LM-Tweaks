@@ -793,6 +793,85 @@ DWORD WINAPI ProdListThread(LPVOID)
 }
 
 // ---------------------------------------------------------------------------
+// Backyard animals: chickens, goats and pigs on a burgage plot hand in a by-product every so
+// many days - eggs every 15, milk every 49, pork every 73 in vanilla (the amount per delivery
+// is 1, or 2 for pork). The wait is computed as
+//     days = round(base days / GetSummedYieldModifierValue(plot))
+// which is also how the game's own backyard-animal perk speeds it up. The three calls to that
+// function inside the by-product step are redirected here, so the wait can be shortened for
+// the player's plots only; every other use of the function is untouched.
+// ---------------------------------------------------------------------------
+const char* kByproductAnchorSig = "C7 03 DD 00 00 00 0F 57 C0 C7 43 04 01 00 00 00";  // milk
+const int kByproductWindow = 0x800;   // the three calls sit a little before the anchor
+
+using YieldModifierFn = float(__fastcall*)(void*);
+YieldModifierFn g_origYieldModifier = nullptr;
+float g_backyardMul = 1.0f;
+
+float __fastcall ByproductModifierHook(void* building)
+{
+    float v = g_origYieldModifier(building);
+    if (g_backyardMul > 1.0f && v > 0.0f && IsPlayerBuilding(building)) v *= g_backyardMul;
+    return v;
+}
+
+bool InstallByproductHook(uint8_t* text, size_t textSize)
+{
+    std::vector<int> sig;
+    ParseHex(kByproductAnchorSig, sig);
+    auto hits = FindAll(text, textSize, sig);
+    if (hits.size() != 1) {
+        Log("[Backyard] by-product step: anchor found %zu times - SKIPPED", hits.size());
+        return false;
+    }
+    uint8_t* anchor = hits[0];
+    uint8_t* from = (anchor - text > kByproductWindow) ? anchor - kByproductWindow : text;
+
+    // the function the by-product step keeps calling in that window is the yield modifier
+    std::vector<uint8_t*> sites;
+    uint8_t* best = nullptr;
+    int candidates = 0;
+    for (uint8_t* p = from; p < anchor; ++p) {
+        if (*p != 0xE8) continue;
+        uint8_t* target = p + 5 + *reinterpret_cast<int32_t*>(p + 1);
+        bool seen = false;
+        for (uint8_t* q = from; q < p; ++q)
+            if (*q == 0xE8 && q + 5 + *reinterpret_cast<int32_t*>(q + 1) == target) { seen = true; break; }
+        if (seen) continue;                      // count each target once
+        int n = 0;
+        for (uint8_t* q = from; q < anchor; ++q)
+            if (*q == 0xE8 && q + 5 + *reinterpret_cast<int32_t*>(q + 1) == target) ++n;
+        if (n == 3) { best = target; ++candidates; }
+    }
+    if (!best || candidates != 1) {
+        Log("[Backyard] by-product step: %d candidates for the yield modifier call - SKIPPED", candidates);
+        return false;
+    }
+    for (uint8_t* p = from; p < anchor; ++p)
+        if (*p == 0xE8 && p + 5 + *reinterpret_cast<int32_t*>(p + 1) == best) sites.push_back(p);
+    if (sites.size() != 3) { Log("[Backyard] by-product step: %zu call sites - SKIPPED", sites.size()); return false; }
+
+    g_origYieldModifier = reinterpret_cast<YieldModifierFn>(best);
+    uint8_t* cave = AllocNear(sites[0], 32);
+    if (!cave) { Log("[Backyard] could not allocate near memory"); return false; }
+    cave[0] = 0xFF; cave[1] = 0x25; *reinterpret_cast<uint32_t*>(cave + 2) = 0;
+    *reinterpret_cast<uint64_t*>(cave + 6) = reinterpret_cast<uint64_t>(&ByproductModifierHook);
+    if (!SealCode(cave, 32)) { Log("[Backyard] VirtualProtect on the cave failed"); return false; }
+
+    for (size_t i = 0; i < sites.size(); ++i) {
+        int64_t rel = reinterpret_cast<int64_t>(cave) - reinterpret_cast<int64_t>(sites[i] + 5);
+        if (rel > INT32_MAX || rel < INT32_MIN) { Log("[Backyard] cave out of range"); return false; }
+        std::vector<int> patch;
+        for (int k = 0; k < 4; ++k) patch.push_back(static_cast<int>((static_cast<uint32_t>(rel) >> (8 * k)) & 0xFF));
+        if (!WriteCode(sites[i] + 1, patch)) { Log("[Backyard] VirtualProtect failed"); return false; }
+    }
+    Log("[Backyard] by-product wait hooked at exe+0x%llX and 2 more (x%.2f, player plots only)",
+        static_cast<unsigned long long>(sites[0] - reinterpret_cast<uint8_t*>(GetModuleHandleA(nullptr))),
+        g_backyardMul);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // BurgageFamilies: how many families a house holds. The building table is NOT used for this
 // (buildingStats.occupantTypes.Y is ignored); two small functions compute it:
 //   SMBuildingMaster::getFamilyCapacity()            8 callers: living space, homeless
@@ -1320,6 +1399,11 @@ void ApplyPatches()
         g_prodMulFood <= 1000.0f && g_prodMulOther <= 1000.0f)
         InstallProductionHook(text, textSize);
     else Log("[Production] disabled");
+
+    // Backyard=F : how much faster backyard animals hand in eggs / milk / pork
+    g_backyardMul = ConfigFloat(cfg, "Backyard", 1.0f);
+    if (g_backyardMul > 1.0f && g_backyardMul <= 100.0f) InstallByproductHook(text, textSize);
+    else Log("[Backyard] disabled");
 
     // Immigration=F : multiplier for the families that move into the player's region
     g_immigrationMul = ConfigFloat(cfg, "Immigration", 1.0f);
