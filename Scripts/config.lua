@@ -12,7 +12,8 @@ return {
     FoodProductionMultiplier      = 1.0,   -- food (bread, meat, cheese, ale, ...)
     ProcessedGoodsMultiplier      = 1.0,   -- everything else crafted (planks, cloth, tools, weapons, ...)
 
-    -- 2. Crops: harvest yield and growth speed
+    -- 2. Crops on YOUR fields: harvest yield and growth speed (an AI lord's fields are
+    --    left at vanilla). Harvest window and threshold below apply to everyone.
     CropYieldMultiplier = {
         Grains     = 1.0,   -- wheat, barley, rye, oats
         Vegetables = 1.0,   -- vegetable plots (carrots, cabbages, beetroots, ...)
@@ -71,6 +72,12 @@ return {
     MaxMilitiaSquads              = 0,   -- number of militia squads (game default 6). 0 = leave unchanged
     MilitiaSquadMaxSize           = 0,   -- men per militia squad. 0 = leave unchanged
                                          -- (new squads; a squad with men keeps its size)
+
+    -- 9b. How many families move into YOUR region every month (the game's own monthly
+    --    population growth, with its approval and free housing modifiers). 2 = twice as many.
+    --    Arrivals come one a day at most, so a month tops out at about 30 families.
+    --    AI lords are not affected. 1 = leave unchanged
+    ImmigrationMultiplier         = 1.0,
 
     -- 9. Growth speed of saplings planted by foresters. 2 = twice as fast. 0 = leave unchanged
     --    (vanilla: the first growth stage alone takes about 250 days)

@@ -61,6 +61,7 @@ local function nativeNeeded()
         or cfg.FreeOxen or #(cfg.FreeAnimalOrders or {}) > 0
         or wl.SoloBreeding or (wl.MaxMultiplier or 1) > 1
         or ((cfg.TreeGrowthRate or 0) > 0 and cfg.TreeGrowthRate ~= 1)
+        or (cfg.ImmigrationMultiplier or 1) > 1
         or familiesSet()) and true or false
 end
 
@@ -97,6 +98,8 @@ local function loadNativePatches()
     -- sapling growth speed (the game's own treeGrowthRate setting is never read by the game)
     local tg = cfg.TreeGrowthRate or 0
     f:write(string.format("TreeGrowth=%.3f\n", tg > 0 and tg or 1))
+    -- families moving into the player's region each month
+    f:write(string.format("Immigration=%.3f\n", cfg.ImmigrationMultiplier or 1))
     f:close()
     if not nativeNeeded() then
         log("native: no setting needs MLTweaksNative.dll - not loaded")

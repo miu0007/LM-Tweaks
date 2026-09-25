@@ -51,6 +51,7 @@ Each entry lists the setting name in `config.lua`.
 ### Production and crops
 - `FoodProductionMultiplier`, `ProcessedGoodsMultiplier` - output per production cycle.
 - `CropYieldMultiplier`, `CropGrowthMultiplier` - per crop group (grains / vegetables / fruits).
+  Both apply to your own fields only; an AI lord's fields keep vanilla values.
 - `HarvestAnytime` - harvest outside the autumn window.
 - `HarvestGrowthThreshold` - how grown a crop must be before it can be harvested (game default 0.3).
 - `NoFertilityLoss` - planting stops draining field fertility; fallow regeneration is untouched.
@@ -79,6 +80,9 @@ Each entry lists the setting name in `config.lua`.
   recover (vanilla needs two animals).
 
 ### Housing
+- `ImmigrationMultiplier` - how many families move into your region each month, on top of
+  the game's own approval and free housing modifiers. Arrivals come one a day at most, so a
+  month tops out at about 30. Your region only.
 - `BurgageFamilies` - how many families a house of each level holds (vanilla: level 1 and 2
   one family, level 3 two, level 4 three). The house expansion that adds a second dwelling to
   the plot still adds one more on top.

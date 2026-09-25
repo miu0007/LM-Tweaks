@@ -14,7 +14,7 @@
 namespace {
 
 const char* kModDir = "ue4ss\\Mods\\MLTweaks\\";
-const char* kVersion = "1.2.0";
+const char* kVersion = "1.3.0-dev";
 
 FILE* g_log = nullptr;
 
@@ -593,6 +593,105 @@ bool InstallTreeGrowthPatch(uint8_t* text, size_t textSize)
 }
 
 // ---------------------------------------------------------------------------
+// Ownership: the engine keeps the player's own pawn in RTSMultiEngineCPP.playerRef,
+// and a Region / SMBuildingMaster points back at the engine. That is enough to tell
+// the player's things from an AI lord's without any help from the Lua side.
+// ---------------------------------------------------------------------------
+const size_t kEnginePlayerRef = 0x5A0;    // RTSMultiEngineCPP.playerRef
+const size_t kRegionEngine = 0x318, kRegionOwnerPawn = 0x350;        // Region.masterPtr / .ownerPawn
+const size_t kBuildingEngine = 0x2E8, kBuildingOwnerPawn = 0x2E0;    // SMBuildingMaster
+const size_t kBuildingCropType = 0x48C;                              // ECropType of a field
+
+bool IsPlayerOwned(uint8_t* obj, size_t engineOffset, size_t ownerOffset)
+{
+    __try {
+        if (!obj) return false;
+        uint8_t* engine = *reinterpret_cast<uint8_t**>(obj + engineOffset);
+        uint8_t* owner = *reinterpret_cast<uint8_t**>(obj + ownerOffset);
+        if (!engine || !owner) return false;
+        return owner == *reinterpret_cast<uint8_t**>(engine + kEnginePlayerRef);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool IsPlayerBuilding(void* b)
+{
+    return IsPlayerOwned(static_cast<uint8_t*>(b), kBuildingEngine, kBuildingOwnerPawn);
+}
+
+// ECropType of a field, or -1 when it cannot be read
+int CropTypeOf(void* b)
+{
+    __try {
+        return b ? *(static_cast<uint8_t*>(b) + kBuildingCropType) : -1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Immigration: Region::<monthly population growth>() sums the very map the game's own
+// GetMonthlyPopGrowthModifiersWithValues hands the UI (base, approval, free housing, ...).
+// The total is how many families move into that region this month: growPopulation spreads
+// that many arrival days evenly over the month, and on such a day a family moves into a
+// plot that still has room - the room getFamilyCapacity reports, so extra BurgageFamilies
+// slots are filled as well. A negative total means families leave instead, so the
+// multiplier is applied to arrivals only.
+// Arrivals cannot be closer together than one a day, so a month cannot take more than
+// about 30 however high the multiplier is.
+// ---------------------------------------------------------------------------
+const char* kImmigrationSig =
+    "48 89 5C 24 10 48 89 74 24 18 48 89 7C 24 20 55 48 8D 6C 24 A9 48 81 EC F0 00 00 00 "
+    "48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 45 47 48 8D 55 F7 33 DB";
+const int kImmigrationStolen = 15;   // three 8-byte-register spills, 5 bytes each
+
+using MonthlyGrowthFn = int(__fastcall*)(void*);
+MonthlyGrowthFn g_origMonthlyGrowth = nullptr;
+float g_immigrationMul = 1.0f;
+
+int __fastcall MonthlyGrowthHook(void* region)
+{
+    int v = g_origMonthlyGrowth(region);
+    if (v <= 0 || !IsPlayerOwned(static_cast<uint8_t*>(region), kRegionEngine, kRegionOwnerPawn)) return v;
+    int scaled = static_cast<int>(v * g_immigrationMul + 0.5f);
+    if (scaled < v) scaled = v;          // never fewer arrivals than vanilla
+    if (scaled > 1000) scaled = 1000;
+    return scaled;
+}
+
+bool InstallImmigrationHook(uint8_t* text, size_t textSize)
+{
+    std::vector<int> sig;
+    ParseHex(kImmigrationSig, sig);
+    auto hits = FindAll(text, textSize, sig);
+    if (hits.size() != 1) {
+        Log("[Immigration] monthly growth: signature found %zu times - SKIPPED", hits.size());
+        return false;
+    }
+    uint8_t* target = hits[0];
+
+    auto tramp = static_cast<uint8_t*>(VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!tramp) { Log("[Immigration] VirtualAlloc failed"); return false; }
+    memcpy(tramp, target, kImmigrationStolen);
+    uint8_t* j = tramp + kImmigrationStolen;
+    j[0] = 0xFF; j[1] = 0x25; *reinterpret_cast<uint32_t*>(j + 2) = 0;
+    *reinterpret_cast<uint64_t*>(j + 6) = reinterpret_cast<uint64_t>(target + kImmigrationStolen);
+    if (!SealCode(tramp, 64)) { Log("[Immigration] VirtualProtect failed"); return false; }
+    g_origMonthlyGrowth = reinterpret_cast<MonthlyGrowthFn>(tramp);
+
+    std::vector<int> patch = { 0xFF, 0x25, 0, 0, 0, 0 };
+    uint64_t hookAddr = reinterpret_cast<uint64_t>(&MonthlyGrowthHook);
+    for (int i = 0; i < 8; ++i) patch.push_back(static_cast<int>((hookAddr >> (8 * i)) & 0xFF));
+    while (static_cast<int>(patch.size()) < kImmigrationStolen) patch.push_back(0x90);
+    if (!WriteCode(target, patch)) { Log("[Immigration] VirtualProtect failed"); return false; }
+    Log("[Immigration] monthly population growth hooked at exe+0x%llX (x%.2f, player region only)",
+        static_cast<unsigned long long>(target - reinterpret_cast<uint8_t*>(GetModuleHandleA(nullptr))),
+        g_immigrationMul);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // BurgageFamilies: how many families a house holds. The building table is NOT used for this
 // (buildingStats.occupantTypes.Y is ignored); two small functions compute it:
 //   SMBuildingMaster::getFamilyCapacity()            8 callers: living space, homeless
@@ -714,16 +813,13 @@ DWORD WINAPI CropSettingsThread(LPVOID)
             float g0 = *growth;
             int y0 = *yield, s0 = season[0], s1 = season[1];
 
-            if (g_cropGrowthMul[c] > 0.0f && g_cropGrowthMul[c] != 1.0f) *growth = g0 * g_cropGrowthMul[c];
-            if (g_cropYieldMulSet[c] > 0.0f && g_cropYieldMulSet[c] != 1.0f) {
-                int v = static_cast<int>(y0 * g_cropYieldMulSet[c] + 0.5f);
-                *yield = v < 1 ? 1 : v;
-            }
+            // The growth rate and the yield per 100 plants are NOT changed here any more:
+            // they are scaled per field in the hooks below, so only the player's fields change.
             if (g_harvestAllYear) { season[0] = 1; season[1] = 365; }
 
             if (f) fprintf(f, "%-6d %-22s %-16s %s\n", c,
-                           (std::to_string(g0) + " -> " + std::to_string(*growth)).c_str(),
-                           (std::to_string(y0) + " -> " + std::to_string(*yield)).c_str(),
+                           (std::to_string(g0) + " x" + std::to_string(g_cropGrowthMul[c])).c_str(),
+                           (std::to_string(y0) + " x" + std::to_string(g_cropYieldMulSet[c])).c_str(),
                            ("(" + std::to_string(s0) + "," + std::to_string(s1) + ") -> (" +
                             std::to_string(season[0]) + "," + std::to_string(season[1]) + ")").c_str());
         }
@@ -737,6 +833,128 @@ DWORD WINAPI CropSettingsThread(LPVOID)
         return 0;
     }
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Crops, for the player's fields only. Two per-building functions carry the numbers:
+//   SMBuildingMaster::getDailyPlantGrowth()                       -> growth per day
+//   SMBuildingMaster::<per-plant yield>(plant, ...)               -> yield of one plant
+// Both are hooked and their result is scaled by the crop group's multiplier when the
+// field belongs to the player, so an AI lord's fields are left at vanilla. Harvest
+// season and the harvest threshold stay global: they are not multipliers.
+// The per-plant yield returns an int in eax; the UI's predicted yield uses the same
+// function, so the tooltip keeps matching what is harvested.
+// ---------------------------------------------------------------------------
+const char* kPlantYieldSig = "48 8B C4 56 41 57 48 83 EC 58 48 8B B4 24 98 00 00 00";
+const int kPlantYieldStolen = 18;
+
+using PlantGrowthFn = float(__fastcall*)(void*);
+using PlantYieldFn = int(__fastcall*)(void*, int, unsigned char, unsigned char, int, void*);
+PlantGrowthFn g_origPlantGrowth = nullptr;
+PlantYieldFn g_origPlantYield = nullptr;
+
+float CropMul(const float* table, void* building)
+{
+    if (!IsPlayerBuilding(building)) return 1.0f;
+    int c = CropTypeOf(building);
+    if (c < 0 || c > 15) return 1.0f;
+    float m = table[c];
+    return (m > 0.0f) ? m : 1.0f;
+}
+
+float __fastcall PlantGrowthHook(void* building)
+{
+    float v = g_origPlantGrowth(building);
+    return v * CropMul(g_cropGrowthMul, building);
+}
+
+int __fastcall PlantYieldHook(void* building, int plant, unsigned char a, unsigned char b, int c, void* out)
+{
+    int v = g_origPlantYield(building, plant, a, b, c, out);
+    float m = CropMul(g_cropYieldMulSet, building);
+    if (v <= 0 || m == 1.0f) return v;
+    int scaled = static_cast<int>(v * m + 0.5f);
+    return scaled < 1 ? 1 : scaled;
+}
+
+// jmp [rip] detour over `stolen` bytes, with a trampoline that runs them and jumps back
+uint8_t* DetourFunction(uint8_t* target, void* hook, int stolen, const char* what)
+{
+    auto tramp = static_cast<uint8_t*>(VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!tramp) { Log("%s: VirtualAlloc failed", what); return nullptr; }
+    memcpy(tramp, target, stolen);
+    uint8_t* j = tramp + stolen;
+    j[0] = 0xFF; j[1] = 0x25; *reinterpret_cast<uint32_t*>(j + 2) = 0;
+    *reinterpret_cast<uint64_t*>(j + 6) = reinterpret_cast<uint64_t>(target + stolen);
+    if (!SealCode(tramp, 64)) { Log("%s: VirtualProtect failed", what); return nullptr; }
+
+    std::vector<int> patch = { 0xFF, 0x25, 0, 0, 0, 0 };
+    uint64_t addr = reinterpret_cast<uint64_t>(hook);
+    for (int i = 0; i < 8; ++i) patch.push_back(static_cast<int>((addr >> (8 * i)) & 0xFF));
+    while (static_cast<int>(patch.size()) < stolen) patch.push_back(0x90);
+    if (!WriteCode(target, patch)) { Log("%s: VirtualProtect failed", what); return nullptr; }
+    return tramp;
+}
+
+// Same, but the detour is a 5-byte relative jump to a small block allocated near the game
+// module, which then jumps to the hook. Used where the stolen bytes have to stay short.
+uint8_t* DetourFunctionNear(uint8_t* target, void* hook, int stolen, const char* what)
+{
+    if (stolen < 5) return nullptr;
+    auto tramp = static_cast<uint8_t*>(VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!tramp) { Log("%s: VirtualAlloc failed", what); return nullptr; }
+    memcpy(tramp, target, stolen);
+    uint8_t* j = tramp + stolen;
+    j[0] = 0xFF; j[1] = 0x25; *reinterpret_cast<uint32_t*>(j + 2) = 0;
+    *reinterpret_cast<uint64_t*>(j + 6) = reinterpret_cast<uint64_t>(target + stolen);
+    if (!SealCode(tramp, 64)) { Log("%s: VirtualProtect failed", what); return nullptr; }
+
+    uint8_t* cave = AllocNear(target, 32);
+    if (!cave) { Log("%s: could not allocate near memory", what); return nullptr; }
+    cave[0] = 0xFF; cave[1] = 0x25; *reinterpret_cast<uint32_t*>(cave + 2) = 0;
+    *reinterpret_cast<uint64_t*>(cave + 6) = reinterpret_cast<uint64_t>(hook);
+    if (!SealCode(cave, 32)) { Log("%s: VirtualProtect failed", what); return nullptr; }
+
+    int64_t rel = reinterpret_cast<int64_t>(cave) - reinterpret_cast<int64_t>(target + 5);
+    if (rel > INT32_MAX || rel < INT32_MIN) { Log("%s: cave out of range", what); return nullptr; }
+    std::vector<int> patch = { 0xE9 };
+    for (int i = 0; i < 4; ++i) patch.push_back(static_cast<int>((static_cast<uint32_t>(rel) >> (8 * i)) & 0xFF));
+    while (static_cast<int>(patch.size()) < stolen) patch.push_back(0x90);
+    if (!WriteCode(target, patch)) { Log("%s: VirtualProtect failed", what); return nullptr; }
+    return tramp;
+}
+
+// The growth site is the start of getDailyPlantGrowth itself (see kCropSettingsGetterSig).
+bool InstallCropHooks(uint8_t* text, size_t textSize, uint8_t* growthFn)
+{
+    bool ok = true;
+    if (growthFn) {
+        // Only the first 13 bytes may be copied: at +13 sits a relative call, which would
+        // point at the wrong address from a trampoline. 13 bytes take the short detour.
+        g_origPlantGrowth = reinterpret_cast<PlantGrowthFn>(
+            DetourFunctionNear(growthFn, &PlantGrowthHook, 13, "[CropGrowth]"));
+        if (g_origPlantGrowth)
+            Log("[CropGrowth] daily plant growth hooked at exe+0x%llX (player fields only)",
+                static_cast<unsigned long long>(growthFn - reinterpret_cast<uint8_t*>(GetModuleHandleA(nullptr))));
+        else ok = false;
+    } else {
+        Log("[CropGrowth] daily plant growth: function not found - SKIPPED");
+        ok = false;
+    }
+
+    std::vector<int> sig;
+    ParseHex(kPlantYieldSig, sig);
+    auto hits = FindAll(text, textSize, sig);
+    if (hits.size() != 1) {
+        Log("[CropYield] per-plant yield: signature found %zu times - SKIPPED", hits.size());
+        return false;
+    }
+    g_origPlantYield = reinterpret_cast<PlantYieldFn>(
+        DetourFunction(hits[0], &PlantYieldHook, kPlantYieldStolen, "[CropYield]"));
+    if (!g_origPlantYield) return false;
+    Log("[CropYield] per-plant yield hooked at exe+0x%llX (player fields only)",
+        static_cast<unsigned long long>(hits[0] - reinterpret_cast<uint8_t*>(GetModuleHandleA(nullptr))));
+    return ok;
 }
 
 float ConfigFloat(const std::string& cfg, const char* key, float def)
@@ -764,7 +982,14 @@ void SetupCropSettingsDump(uint8_t* text, size_t textSize)
     Log("[Dump] crop settings class ptr at exe+0x%llX",
         static_cast<unsigned long long>(reinterpret_cast<uint8_t*>(g_cropSettingsClassPtr) - reinterpret_cast<uint8_t*>(GetModuleHandleA(nullptr))));
     CloseHandle(CreateThread(nullptr, 0, CropSettingsThread, nullptr, 0, nullptr));
-    Log("[CropSettings] applied on the untouched values; see crop_settings.txt");
+    Log("[CropSettings] harvest season / threshold applied; vanilla values in crop_settings.txt");
+    // The multipliers themselves are applied per field, so they only affect the player.
+    // This has to come last: the pointer above is read out of the very bytes it patches.
+    bool anyCrop = false;
+    for (int c = 0; c < 16; ++c)
+        if (g_cropGrowthMul[c] != 1.0f || g_cropYieldMulSet[c] != 1.0f) anyCrop = true;
+    if (anyCrop) InstallCropHooks(text, textSize, hits[0]);
+    else Log("[CropGrowth] and [CropYield] per-field multipliers disabled");
 }
 
 int ConfigInt(const std::string& cfg, const char* key, int def)
@@ -889,8 +1114,11 @@ void ApplyPatches()
         else Log("[CropSettings] disabled");
     }
 
-    if (anyYield) InstallHarvestHook(text, textSize);
-    else Log("[CropYield] disabled");
+    // The per-plant yield hook (player fields only) already covers the harvest, so the older
+    // global harvest-handler patch is only used when that hook could not be installed.
+    if (!anyYield) Log("[CropYieldPlants] disabled");
+    else if (g_origPlantYield) Log("[CropYieldPlants] covered by the per-plant yield hook");
+    else InstallHarvestHook(text, textSize);
 
     // FreeUpgrade=13,19,... : upgrade IDs (EUpgradeType) whose regional wealth cost becomes 0
     {
@@ -918,6 +1146,11 @@ void ApplyPatches()
     g_wildlifeMax = ConfigInt(cfg, "WildlifeMax", 1);
     if (g_wildlifeMax > 1 && g_wildlifeMax <= 1000) InstallWildlifeCapHook(text, textSize);
     else Log("[WildlifeMax] disabled");
+
+    // Immigration=F : multiplier for the families that move into the player's region
+    g_immigrationMul = ConfigFloat(cfg, "Immigration", 1.0f);
+    if (g_immigrationMul > 1.0f && g_immigrationMul <= 100.0f) InstallImmigrationHook(text, textSize);
+    else Log("[Immigration] disabled");
 
     // TreeGrowth=F : growth speed multiplier for saplings planted by foresters
     g_treeGrowthMul = ConfigFloat(cfg, "TreeGrowth", 1.0f);
