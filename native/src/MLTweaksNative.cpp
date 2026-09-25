@@ -32,6 +32,27 @@ void Log(const char* fmt, ...)
     fflush(g_log);
 }
 
+// native_log.txt is closed once the patches are in, so anything a background thread wants to
+// report later reopens it for a single line.
+void LogLate(const char* fmt, ...)
+{
+    FILE* f = nullptr;
+    if (fopen_s(&f, (std::string(kModDir) + "native_log.txt").c_str(), "a") != 0 || !f) return;
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    fprintf(f, "%02d:%02d:%02d ", t.wHour, t.wMinute, t.wSecond);
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(f, fmt, args);
+    va_end(args);
+    fputc('\n', f);
+    fclose(f);
+}
+
+// Counters that show the owner check is doing something: "others" must stay > 0 in a game
+// with an AI lord, otherwise everything would be treated as the player's.
+volatile LONG g_ownProd[2] = {}, g_ownCrop[2] = {}, g_ownImm[2] = {};
+
 struct Patch {
     const char* group;       // config key that enables this patch
     const char* name;
@@ -653,7 +674,9 @@ float g_immigrationMul = 1.0f;
 int __fastcall MonthlyGrowthHook(void* region)
 {
     int v = g_origMonthlyGrowth(region);
-    if (v <= 0 || !IsPlayerOwned(static_cast<uint8_t*>(region), kRegionEngine, kRegionOwnerPawn)) return v;
+    bool mine = IsPlayerOwned(static_cast<uint8_t*>(region), kRegionEngine, kRegionOwnerPawn);
+    InterlockedIncrement(&g_ownImm[mine ? 0 : 1]);
+    if (v <= 0 || !mine) return v;
     int scaled = static_cast<int>(v * g_immigrationMul + 0.5f);
     if (scaled < v) scaled = v;          // never fewer arrivals than vanilla
     if (scaled > 1000) scaled = 1000;
@@ -715,7 +738,10 @@ volatile LONG g_prodListReady = 0;
 int __fastcall CraftCountHook(void* b)
 {
     int v = g_origCraftCount(b);
-    if (v <= 0 || !g_prodListReady || !IsPlayerBuilding(b)) return v;
+    if (v <= 0 || !g_prodListReady) return v;
+    bool mine = IsPlayerBuilding(b);
+    InterlockedIncrement(&g_ownProd[mine ? 0 : 1]);
+    if (!mine) return v;
     int t = BuildingType(static_cast<uint8_t*>(b));
     float m = (t >= 0 && t < 512 && g_prodFoodBuilding[t]) ? g_prodMulFood : g_prodMulOther;
     if (m <= 1.0f) return v;
@@ -751,8 +777,15 @@ DWORD WINAPI ProdListThread(LPVOID)
             p = e;
         }
         InterlockedExchange(&g_prodListReady, 1);
-        Log("[Production] food buildings from native_runtime.cfg: %d types (food x%.2f, other x%.2f)",
-            count, g_prodMulFood, g_prodMulOther);
+        LogLate("[Production] food buildings from native_runtime.cfg: %d types (food x%.2f, other x%.2f)",
+                count, g_prodMulFood, g_prodMulOther);
+        // Twice, so the owner check can be seen working: "others" counts the things this
+        // build deliberately leaves alone (an AI lord's buildings, fields and regions).
+        for (int k = 0; k < 2; ++k) {
+            Sleep(k == 0 ? 60000 : 240000);
+            LogLate("[Owner check] scaled/left alone - production %ld/%ld, crop yield %ld/%ld, immigration %ld/%ld",
+                    g_ownProd[0], g_ownProd[1], g_ownCrop[0], g_ownCrop[1], g_ownImm[0], g_ownImm[1]);
+        }
         return 0;
     }
     Log("[Production] native_runtime.cfg never appeared - output left at vanilla");
@@ -939,6 +972,7 @@ float __fastcall PlantGrowthHook(void* building)
 int __fastcall PlantYieldHook(void* building, int plant, unsigned char a, unsigned char b, int c, void* out)
 {
     int v = g_origPlantYield(building, plant, a, b, c, out);
+    InterlockedIncrement(&g_ownCrop[IsPlayerBuilding(building) ? 0 : 1]);
     float m = CropMul(g_cropYieldMulSet, building);
     if (v <= 0 || m == 1.0f) return v;
     int scaled = static_cast<int>(v * m + 0.5f);
