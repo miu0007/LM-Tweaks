@@ -949,10 +949,9 @@ DWORD WINAPI CropSettingsThread(LPVOID)
 const char* kPlantYieldSig = "48 8B C4 56 41 57 48 83 EC 58 48 8B B4 24 98 00 00 00";
 const int kPlantYieldStolen = 18;
 
-using PlantGrowthFn = float(__fastcall*)(void*);
 using PlantYieldFn = int(__fastcall*)(void*, int, unsigned char, unsigned char, int, void*);
-PlantGrowthFn g_origPlantGrowth = nullptr;
 PlantYieldFn g_origPlantYield = nullptr;
+bool g_harvestHookActive = false;   // the older global patch for garden / orchard plants
 
 float CropMul(const float* table, void* building)
 {
@@ -963,16 +962,20 @@ float CropMul(const float* table, void* building)
     return (m > 0.0f) ? m : 1.0f;
 }
 
-float __fastcall PlantGrowthHook(void* building)
+// Called from the growth cave with the field in rcx; returns the growth multiplier.
+float __fastcall GrowthMulFor(void* building)
 {
-    float v = g_origPlantGrowth(building);
-    return v * CropMul(g_cropGrowthMul, building);
+    return CropMul(g_cropGrowthMul, building);
 }
 
 int __fastcall PlantYieldHook(void* building, int plant, unsigned char a, unsigned char b, int c, void* out)
 {
     int v = g_origPlantYield(building, plant, a, b, c, out);
     InterlockedIncrement(&g_ownCrop[IsPlayerBuilding(building) ? 0 : 1]);
+    // Garden and orchard plants are handled by the harvest-handler patch below; scaling them
+    // here as well would apply the multiplier twice.
+    int type = CropTypeOf(building);
+    if (g_harvestHookActive && type >= 0 && type < 16 && g_cropYieldMul[type] != 1) return v;
     float m = CropMul(g_cropYieldMulSet, building);
     if (v <= 0 || m == 1.0f) return v;
     int scaled = static_cast<int>(v * m + 0.5f);
@@ -1044,23 +1047,64 @@ bool InstallProductionHook(uint8_t* text, size_t textSize)
     return true;
 }
 
-// The growth site is the start of getDailyPlantGrowth itself (see kCropSettingsGetterSig).
-bool InstallCropHooks(uint8_t* text, size_t textSize, uint8_t* growthFn)
+// Growth: the daily growth step loads BaseDailyGrowthRate[cropType] straight out of the crop
+// settings (SMBuildingMaster::getDailyPlantGrowth is only a Blueprint helper - the game never
+// calls it). The load is redirected to a cave that runs it and then multiplies the value by
+// this field's factor, so nothing changes for an AI lord.
+//   movzx ecx,[rbx+48Ch] / mov rax,[rdi+110h] / movss xmm9,[rax+rcx*4+38h]   rbx = the field
+const char* kGrowthRateSig =
+    "0F B6 8B 8C 04 00 00 48 8B 87 10 01 00 00 F3 44 0F 10 4C 88 38";
+const int kGrowthRateOffset = 14;   // the movss itself
+const int kGrowthRateLen = 7;
+
+bool InstallGrowthPatch(uint8_t* text, size_t textSize)
 {
-    bool ok = true;
-    if (growthFn) {
-        // Only the first 13 bytes may be copied: at +13 sits a relative call, which would
-        // point at the wrong address from a trampoline. 13 bytes take the short detour.
-        g_origPlantGrowth = reinterpret_cast<PlantGrowthFn>(
-            DetourFunctionNear(growthFn, &PlantGrowthHook, 13, "[CropGrowth]"));
-        if (g_origPlantGrowth)
-            Log("[CropGrowth] daily plant growth hooked at exe+0x%llX (player fields only)",
-                static_cast<unsigned long long>(growthFn - reinterpret_cast<uint8_t*>(GetModuleHandleA(nullptr))));
-        else ok = false;
-    } else {
-        Log("[CropGrowth] daily plant growth: function not found - SKIPPED");
-        ok = false;
+    std::vector<int> sig;
+    ParseHex(kGrowthRateSig, sig);
+    auto hits = FindAll(text, textSize, sig);
+    if (hits.size() != 1) {
+        Log("[CropGrowth] growth rate read: signature found %zu times - SKIPPED", hits.size());
+        return false;
     }
+    uint8_t* site = hits[0] + kGrowthRateOffset;
+    uint8_t* back = site + kGrowthRateLen;
+    uint8_t* cave = AllocNear(site, 128);
+    if (!cave) { Log("[CropGrowth] could not allocate near memory"); return false; }
+
+    std::vector<uint8_t> c;
+    auto emit = [&](std::initializer_list<uint8_t> b) { c.insert(c.end(), b); };
+    emit({ 0xF3, 0x44, 0x0F, 0x10, 0x4C, 0x88, 0x38 });   // movss xmm9,[rax+rcx*4+38h] (original)
+    emit({ 0x48, 0x8B, 0xC4 });                           // mov rax, rsp
+    emit({ 0x48, 0x83, 0xEC, 0x38 });                     // sub rsp, 38h
+    emit({ 0x48, 0x83, 0xE4, 0xF0 });                     // and rsp, -16   (align for the call)
+    emit({ 0x48, 0x89, 0x44, 0x24, 0x28 });               // mov [rsp+28h], rax   (old rsp)
+    emit({ 0x48, 0x8B, 0xCB });                           // mov rcx, rbx         (the field)
+    emit({ 0x48, 0xB8 });                                 // mov rax, &GrowthMulFor
+    uint64_t fn = reinterpret_cast<uint64_t>(&GrowthMulFor);
+    for (int i = 0; i < 8; ++i) c.push_back(static_cast<uint8_t>(fn >> (8 * i)));
+    emit({ 0xFF, 0xD0 });                                 // call rax
+    emit({ 0xF3, 0x44, 0x0F, 0x59, 0xC8 });               // mulss xmm9, xmm0
+    emit({ 0x48, 0x8B, 0x64, 0x24, 0x28 });               // mov rsp, [rsp+28h]
+    emit({ 0xFF, 0x25, 0, 0, 0, 0 });                     // jmp [rip] -> back
+    uint64_t b = reinterpret_cast<uint64_t>(back);
+    for (int i = 0; i < 8; ++i) c.push_back(static_cast<uint8_t>(b >> (8 * i)));
+    memcpy(cave, c.data(), c.size());
+    if (!SealCode(cave, c.size())) { Log("[CropGrowth] VirtualProtect on the cave failed"); return false; }
+
+    int64_t rel = reinterpret_cast<int64_t>(cave) - reinterpret_cast<int64_t>(site + 5);
+    if (rel > INT32_MAX || rel < INT32_MIN) { Log("[CropGrowth] cave out of range"); return false; }
+    std::vector<int> patch = { 0xE9 };
+    for (int i = 0; i < 4; ++i) patch.push_back(static_cast<int>((static_cast<uint32_t>(rel) >> (8 * i)) & 0xFF));
+    while (static_cast<int>(patch.size()) < kGrowthRateLen) patch.push_back(0x90);
+    if (!WriteCode(site, patch)) { Log("[CropGrowth] VirtualProtect failed"); return false; }
+    Log("[CropGrowth] daily growth rate patched at exe+0x%llX (player fields only)",
+        static_cast<unsigned long long>(site - reinterpret_cast<uint8_t*>(GetModuleHandleA(nullptr))));
+    return true;
+}
+
+bool InstallCropHooks(uint8_t* text, size_t textSize)
+{
+    bool ok = InstallGrowthPatch(text, textSize);
 
     std::vector<int> sig;
     ParseHex(kPlantYieldSig, sig);
@@ -1108,7 +1152,7 @@ void SetupCropSettingsDump(uint8_t* text, size_t textSize)
     bool anyCrop = false;
     for (int c = 0; c < 16; ++c)
         if (g_cropGrowthMul[c] != 1.0f || g_cropYieldMulSet[c] != 1.0f) anyCrop = true;
-    if (anyCrop) InstallCropHooks(text, textSize, hits[0]);
+    if (anyCrop) InstallCropHooks(text, textSize);
     else Log("[CropGrowth] and [CropYield] per-field multipliers disabled");
 }
 
@@ -1236,9 +1280,11 @@ void ApplyPatches()
 
     // The per-plant yield hook (player fields only) already covers the harvest, so the older
     // global harvest-handler patch is only used when that hook could not be installed.
-    if (!anyYield) Log("[CropYieldPlants] disabled");
-    else if (g_origPlantYield) Log("[CropYieldPlants] covered by the per-plant yield hook");
-    else InstallHarvestHook(text, textSize);
+    // Garden and orchard plants: the harvest handler is the path that works for them, so it
+    // stays. It is global - it has no building to check the owner of - and the per-plant hook
+    // skips the crop types it covers.
+    if (anyYield) g_harvestHookActive = InstallHarvestHook(text, textSize);
+    else Log("[CropYieldPlants] disabled");
 
     // FreeUpgrade=13,19,... : upgrade IDs (EUpgradeType) whose regional wealth cost becomes 0
     {
