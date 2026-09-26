@@ -53,6 +53,21 @@ void LogLate(const char* fmt, ...)
 // with an AI lord, otherwise everything would be treated as the player's.
 volatile LONG g_ownProd[2] = {}, g_ownCrop[2] = {}, g_ownImm[2] = {};
 
+// How long the hooks themselves take, to tell a slow hook from a slow game.
+volatile LONG64 g_hookTicks[3] = {}, g_hookCalls[3] = {};   // 0 = plant yield, 1 = growth, 2 = craft count
+
+struct HookTimer {
+    int slot;
+    LARGE_INTEGER t0;
+    explicit HookTimer(int s) : slot(s) { QueryPerformanceCounter(&t0); }
+    ~HookTimer() {
+        LARGE_INTEGER t1;
+        QueryPerformanceCounter(&t1);
+        InterlockedAdd64(&g_hookTicks[slot], t1.QuadPart - t0.QuadPart);
+        InterlockedIncrement64(&g_hookCalls[slot]);
+    }
+};
+
 struct Patch {
     const char* group;       // config key that enables this patch
     const char* name;
@@ -738,6 +753,7 @@ volatile LONG g_prodListReady = 0;
 int __fastcall CraftCountHook(void* b)
 {
     int v = g_origCraftCount(b);
+    HookTimer timer(2);
     if (v <= 0 || !g_prodListReady) return v;
     bool mine = IsPlayerBuilding(b);
     InterlockedIncrement(&g_ownProd[mine ? 0 : 1]);
@@ -785,6 +801,12 @@ DWORD WINAPI ProdListThread(LPVOID)
             Sleep(k == 0 ? 60000 : 240000);
             LogLate("[Owner check] scaled/left alone - production %ld/%ld, crop yield %ld/%ld, immigration %ld/%ld",
                     g_ownProd[0], g_ownProd[1], g_ownCrop[0], g_ownCrop[1], g_ownImm[0], g_ownImm[1]);
+            LARGE_INTEGER freq;
+            QueryPerformanceFrequency(&freq);
+            const char* names[3] = { "plant yield", "growth", "craft count" };
+            for (int h = 0; h < 3; ++h)
+                LogLate("[Hook cost] %-12s %lld calls, %.1f ms total", names[h],
+                        g_hookCalls[h], 1000.0 * (double)g_hookTicks[h] / (double)freq.QuadPart);
         }
         return 0;
     }
@@ -1044,19 +1066,25 @@ float CropMul(const float* table, void* building)
 // Called from the growth cave with the field in rcx; returns the growth multiplier.
 float __fastcall GrowthMulFor(void* building)
 {
+    HookTimer timer(1);
     return CropMul(g_cropGrowthMul, building);
 }
 
 int __fastcall PlantYieldHook(void* building, int plant, unsigned char a, unsigned char b, int c, void* out)
 {
     int v = g_origPlantYield(building, plant, a, b, c, out);
-    InterlockedIncrement(&g_ownCrop[IsPlayerBuilding(building) ? 0 : 1]);
+    HookTimer timer(0);
+    if (v <= 0) return v;
     // Garden and orchard plants are handled by the harvest-handler patch below; scaling them
     // here as well would apply the multiplier twice.
     int type = CropTypeOf(building);
-    if (g_harvestHookActive && type >= 0 && type < 16 && g_cropYieldMul[type] != 1) return v;
-    float m = CropMul(g_cropYieldMulSet, building);
-    if (v <= 0 || m == 1.0f) return v;
+    if (type < 0 || type > 15) return v;
+    if (g_harvestHookActive && g_cropYieldMul[type] != 1) return v;
+    float m = g_cropYieldMulSet[type];
+    if (m <= 0.0f || m == 1.0f) return v;
+    bool mine = IsPlayerBuilding(building);
+    InterlockedIncrement(&g_ownCrop[mine ? 0 : 1]);
+    if (!mine) return v;
     int scaled = static_cast<int>(v * m + 0.5f);
     return scaled < 1 ? 1 : scaled;
 }

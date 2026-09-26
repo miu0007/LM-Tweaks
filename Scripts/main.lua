@@ -697,11 +697,18 @@ local miningState = {}
 local wildWinterHold = nil   -- last logged state of the winter refill hold
 local miningSeen = {}
 
+-- Rough timing of each phase: liveTick runs on the game thread, so anything slow here is a
+-- stutter in the game. Logged only when a tick takes longer than tickWarnMs.
+local tickWarnMs = 100
+local function ms(t0) return (os.clock() - t0) * 1000 end
+
 local function liveTick()
     local engine = getEngine()
     if not engine then return end
+    local tStart = os.clock()
     local pawn = getPlayerPawn(engine)
     local st = { walk = 0, archer = 0, storage = 0, deposit = 0 }
+    local phase = {}
 
     -- 6. militia cap
     if pawn and (cfg.MaxMilitiaSquads or 0) > 0 then
@@ -718,8 +725,8 @@ local function liveTick()
 
     -- 11. bandit camp cap (thefts are done monthly by encamped bandit squads)
     if (cfg.MaxBanditCamps or -1) >= 0 then
-        local gi = FindFirstOf("MLGameInstance")
-        if valid(gi) then
+        local gi = cachedFirstOf("gi", "MLGameInstance")
+        if gi then
             local cur = S(function() return gi.gameSetup.currentGameSetup.maxBanditCamps end)
             if (checkCount.banditSeen or 0) == 0 then
                 checkLog("banditSeen", "max bandit camps on first read: " .. tostring(cur))
@@ -733,8 +740,8 @@ local function liveTick()
 
     -- 11. raid interval: scale daysUntilNextRaid whenever a new raid gets scheduled
     local rim = cfg.RaidIntervalMultiplier or 1
-    local wmaster = FindFirstOf("WeatherMaster")
-    if valid(wmaster) then
+    local wmaster = cachedFirstOf("weather", "WeatherMaster")
+    if wmaster then
         local days = S(function() return wmaster.daysUntilNextRaid end)
         if type(days) == "number" then
             local key = wmaster:GetAddress()
@@ -763,7 +770,10 @@ local function liveTick()
         for i = 1, arrLen(cs) do playerSquads[S(function() return cs[i] end, -1)] = true end
     end
 
+    phase.head = elapsedMs(tStart)
+
     -- 4a / 5. units
+    local tUnits = os.clock()
     local wm = cfg.VillagerWalkSpeedMultiplier or 1
     local am = cfg.AnimalWalkSpeedMultiplier or 1
     local dm, rm = cfg.ArcherDamageMultiplier or 1, cfg.ArcherRangeMultiplier or 1
@@ -800,9 +810,13 @@ local function liveTick()
         end
     end
 
+    phase.units = elapsedMs(tUnits)
+    phase.unitCount = arrLen(units)
+
     -- 3. storage of existing buildings (player owned)
+    local tStorage = os.clock()
     local sm = cfg.StorageMultiplier or 1
-    if sm ~= 1 then
+    if sm ~= 1 and tickNo % 4 == 0 then
         for _, b in ipairs(FindAllOf("SMBuildingMaster") or {}) do
             if valid(b) then
                 local owner = S(function() return b.ownerPawn end)
@@ -816,8 +830,11 @@ local function liveTick()
         end
     end
 
+    phase.storage = elapsedMs(tStorage)
+
     -- 10. mining: when a mine's own stock of ore grows, add (mult-1) x the increase
-    if pawn then
+    local tMining = os.clock()
+    if pawn and tickNo % 2 == 1 then
         local pawnAddr = pawn:GetAddress()
         for _, b in ipairs(FindAllOf("SMBuildingMaster") or {}) do
             if valid(b) then
@@ -863,17 +880,20 @@ local function liveTick()
         end
     end
 
+    phase.mining = elapsedMs(tMining)
+
     -- 14. wild gathering spots: raise the cap and top the amount back up
+    local tWild = os.clock()
     local wr = cfg.WildResources or {}
-    if wr.Enabled then
+    if wr.Enabled and tickNo % 4 == 2 then
         local caps = wr.Capacity or {}
         -- Winter is when the game drains the seasonal spots (the tooltip says "in decline").
         -- With StopRefillInWinter the refill stands down for those spots, so winter plays out
         -- as usual and the refill picks up again in spring.
         local holdNow = false
         if wr.Refill and wr.StopRefillInWinter then
-            local wm = FindFirstOf("WeatherMaster")
-            if valid(wm) then
+            local wm = cachedFirstOf("weather", "WeatherMaster")
+            if wm then
                 local iw = S(function() return wm.isWinter end)
                 if iw == nil then iw = (S(function() return wm.Season end, -1) == 0) end  -- ESeason::Winter
                 holdNow = iw and true or false
@@ -884,9 +904,16 @@ local function liveTick()
                 flushReport()
             end
         end
+        -- the bushes and fishing spots of a map barely change, so the actor lists are
+        -- looked up once a minute instead of on every pass
+        if not cache.wild or tickNo - cache.wildAt >= 20 then
+            cache.wild = {}
+            for _, w in ipairs(WILD_RESOURCE_BP) do cache.wild[w.key] = FindAllOf(w.class) or {} end
+            cache.wildAt = tickNo
+        end
         for _, w in ipairs(WILD_RESOURCE_BP) do
             local want = caps[w.key] or 0
-            for _, r in ipairs(FindAllOf(w.class) or {}) do
+            for _, r in ipairs(cache.wild[w.key] or {}) do
                 if valid(r) then
                     local cap = S(function() return r.capacity end, 0)
                     if want > 0 and cap ~= want and pcall(function() r.capacity = want end) then
@@ -905,8 +932,11 @@ local function liveTick()
         end
     end
 
+    phase.wild = elapsedMs(tWild)
+
     -- 8c. rich deposits currently in the world
-    if cfg.AllResourcesRich then
+    local tRich = os.clock()
+    if cfg.AllResourcesRich and tickNo % 8 == 3 then
         local deps = S(function() return engine.deposits end)
         for i = 1, arrLen(deps) do
             local d = S(function() return deps[i] end)
@@ -915,6 +945,15 @@ local function liveTick()
             end
         end
         for _, sg in ipairs(FindAllOf("MLSaveGame") or {}) do patchSaveGame(sg, "memory") end
+    end
+
+    phase.rich = elapsedMs(tRich)
+    local total = elapsedMs(tStart)
+    if total > tickWarnMs then
+        log(string.format("tick %.0f ms: units %.0f (%d), storage %.0f, mining %.0f, wild %.0f, rich %.0f, head %.0f",
+            total, phase.units or 0, phase.unitCount or 0, phase.storage or 0, phase.mining or 0,
+            phase.wild or 0, phase.rich or 0, phase.head or 0))
+        flushReport()
     end
 
     st.mined = st.mined or 0
