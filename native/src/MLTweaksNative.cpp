@@ -639,6 +639,7 @@ const size_t kBuildingEngine = 0x2E8, kBuildingOwnerPawn = 0x2E0;    // SMBuildi
 const size_t kBuildingCropType = 0x48C;                              // ECropType of a field
 
 uint8_t* g_playerRef = nullptr;   // remembered from the checks that work, for the ones that do not
+volatile LONG g_playerRefChanges = 0;
 
 bool IsPlayerOwned(uint8_t* obj, size_t engineOffset, size_t ownerOffset)
 {
@@ -648,7 +649,11 @@ bool IsPlayerOwned(uint8_t* obj, size_t engineOffset, size_t ownerOffset)
         uint8_t* owner = *reinterpret_cast<uint8_t**>(obj + ownerOffset);
         if (!engine || !owner) return false;
         uint8_t* ref = *reinterpret_cast<uint8_t**>(engine + kEnginePlayerRef);
-        if (ref) g_playerRef = ref;
+        if (ref) {
+            if (g_playerRef && g_playerRef != ref && InterlockedIncrement(&g_playerRefChanges) <= 3)
+                LogLate("[Owner check] the player pawn changed: %p -> %p", g_playerRef, ref);
+            g_playerRef = ref;
+        }
         return owner == ref;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -1391,6 +1396,71 @@ uint8_t* DetourFunctionNear(uint8_t* target, void* hook, int stolen, const char*
     return tramp;
 }
 
+// ---------------------------------------------------------------------------
+// RegionUiGuard: a crash in the game's own code. Once per frame the player pawn runs a step
+// that notices "the region I am showing has changed" and refreshes every goods panel from
+// that region's stock. It decides the current region first (pawn+CC0h, kept only while the
+// region still belongs to this pawn), but the refresh loop reads that pointer again without
+// checking it, so when the step has just cleared it the loop walks a null region and the game
+// dies reading address 0x538 - the stock array inside the region.
+//
+// The same decision is made here in advance. When the step is about to end up with no current
+// region while still remembering one (pawn+D20h), the remembered one is forgotten, which is
+// exactly the "nothing changed" case the step skips. The panels keep their old numbers for
+// that frame and refresh normally as soon as there is a region again.
+// ---------------------------------------------------------------------------
+const char* kRegionUiSig = "40 55 53 41 56 41 57 48 8D AC 24 68 FF FF FF 48 81 EC 98 01 00 00 "
+                           "48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 85 80 00 00 00 48 8B 99 C0 0C 00 00";
+const int kRegionUiStolen = 15;
+const size_t kPawnHoverRegion = 0x980;   // the region the pawn is looking at
+const size_t kPawnCurRegion = 0xCC0;     // the current region, cleared when it is not ours
+const size_t kPawnShownRegion = 0xD20;   // the region the panels were last filled from
+
+using RegionUiFn = void(__fastcall*)(void*);
+RegionUiFn g_origRegionUi = nullptr;
+volatile LONG g_regionUiSaves = 0;
+
+void __fastcall RegionUiHook(void* pawnPtr)
+{
+    __try {
+        auto pawn = static_cast<uint8_t*>(pawnPtr);
+        if (pawn) {
+            uint8_t* hover = *reinterpret_cast<uint8_t**>(pawn + kPawnHoverRegion);
+            uint8_t* cur = *reinterpret_cast<uint8_t**>(pawn + kPawnCurRegion);
+            uint8_t* shown = *reinterpret_cast<uint8_t**>(pawn + kPawnShownRegion);
+            uint8_t* hoverOwner = hover ? *reinterpret_cast<uint8_t**>(hover + kRegionOwnerPawn) : nullptr;
+            uint8_t* curOwner = cur ? *reinterpret_cast<uint8_t**>(cur + kRegionOwnerPawn) : nullptr;
+            // hover is not ours, so the step keeps the current region; that one is not ours
+            // either, so it clears it - and then refreshes against nothing.
+            if (hover && hoverOwner != pawn && cur && curOwner != pawn && shown) {
+                *reinterpret_cast<uint8_t**>(pawn + kPawnShownRegion) = nullptr;
+                if (InterlockedIncrement(&g_regionUiSaves) <= 5)
+                    LogLate("[RegionUi] refresh skipped: pawn %p, current region %p owned by %p, "
+                            "looking at %p owned by %p", pawn, cur, curOwner, hover, hoverOwner);
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    g_origRegionUi(pawnPtr);
+}
+
+bool InstallRegionUiGuard(uint8_t* text, size_t textSize)
+{
+    std::vector<int> sig;
+    ParseHex(kRegionUiSig, sig);
+    auto hits = FindAll(text, textSize, sig);
+    if (hits.size() != 1) {
+        Log("[RegionUi] region panel refresh: signature found %zu times - SKIPPED", hits.size());
+        return false;
+    }
+    g_origRegionUi = reinterpret_cast<RegionUiFn>(
+        DetourFunction(hits[0], &RegionUiHook, kRegionUiStolen, "[RegionUi]"));
+    if (!g_origRegionUi) return false;
+    Log("[RegionUi] region panel refresh guarded at exe+0x%llX",
+        static_cast<unsigned long long>(hits[0] - reinterpret_cast<uint8_t*>(GetModuleHandleA(nullptr))));
+    return true;
+}
+
 bool InstallProductionHook(uint8_t* text, size_t textSize)
 {
     std::vector<int> sig;
@@ -1565,6 +1635,9 @@ void ApplyPatches()
     uint8_t* text = nullptr;
     size_t textSize = 0;
     if (!GetTextSection(text, textSize)) { Log("ERROR: .text section not found"); return; }
+
+    // Always on: a crash in the game's own region panel refresh, see RegionUiGuard above.
+    InstallRegionUiGuard(text, textSize);
 
     for (const Patch& p : kPatches) {
         if (!GroupEnabled(cfg, p.group)) { Log("[%s] %s: disabled", p.group, p.name); continue; }
