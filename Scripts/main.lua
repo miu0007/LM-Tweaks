@@ -702,12 +702,25 @@ local miningSeen = {}
 -- Rough timing of each phase: liveTick runs on the game thread, so anything slow here is a
 -- stutter in the game. Logged only when a tick takes longer than tickWarnMs.
 local tickWarnMs = 100
+local function elapsedMs(t0) return (os.clock() - t0) * 1000 end
+
+-- Only the unit pass is cheap enough to run every tick; the rest takes turns, and the object
+-- lookups that cost the most are remembered.
+local tickNo = 0
+local cache = { gi = nil, weather = nil, wild = nil, wildAt = -100 }
+
+local function cachedFirstOf(key, class)
+    if not valid(cache[key]) then cache[key] = FindFirstOf(class) end
+    return valid(cache[key]) and cache[key] or nil
+end
+
 local function ms(t0) return (os.clock() - t0) * 1000 end
 
 local function liveTick()
     local engine = getEngine()
     if not engine then return end
     local tStart = os.clock()
+    tickNo = tickNo + 1
     local pawn = getPlayerPawn(engine)
     local st = { walk = 0, archer = 0, storage = 0, deposit = 0 }
     local phase = {}

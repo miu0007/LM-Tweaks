@@ -51,7 +51,7 @@ void LogLate(const char* fmt, ...)
 
 // Counters that show the owner check is doing something: "others" must stay > 0 in a game
 // with an AI lord, otherwise everything would be treated as the player's.
-volatile LONG g_ownProd[2] = {}, g_ownCrop[2] = {}, g_ownImm[2] = {};
+volatile LONG g_ownProd[2] = {}, g_ownCrop[2] = {}, g_ownImm[2] = {}, g_ownYard[2] = {};
 
 // How long the hooks themselves take, to tell a slow hook from a slow game.
 volatile LONG64 g_hookTicks[3] = {}, g_hookCalls[3] = {};   // 0 = plant yield, 1 = growth, 2 = craft count
@@ -638,6 +638,8 @@ const size_t kRegionEngine = 0x318, kRegionOwnerPawn = 0x350;        // Region.m
 const size_t kBuildingEngine = 0x2E8, kBuildingOwnerPawn = 0x2E0;    // SMBuildingMaster
 const size_t kBuildingCropType = 0x48C;                              // ECropType of a field
 
+uint8_t* g_playerRef = nullptr;   // remembered from the checks that work, for the ones that do not
+
 bool IsPlayerOwned(uint8_t* obj, size_t engineOffset, size_t ownerOffset)
 {
     __try {
@@ -645,7 +647,9 @@ bool IsPlayerOwned(uint8_t* obj, size_t engineOffset, size_t ownerOffset)
         uint8_t* engine = *reinterpret_cast<uint8_t**>(obj + engineOffset);
         uint8_t* owner = *reinterpret_cast<uint8_t**>(obj + ownerOffset);
         if (!engine || !owner) return false;
-        return owner == *reinterpret_cast<uint8_t**>(engine + kEnginePlayerRef);
+        uint8_t* ref = *reinterpret_cast<uint8_t**>(engine + kEnginePlayerRef);
+        if (ref) g_playerRef = ref;
+        return owner == ref;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
@@ -654,6 +658,48 @@ bool IsPlayerOwned(uint8_t* obj, size_t engineOffset, size_t ownerOffset)
 bool IsPlayerBuilding(void* b)
 {
     return IsPlayerOwned(static_cast<uint8_t*>(b), kBuildingEngine, kBuildingOwnerPawn);
+}
+
+// How much of one good a building currently holds (-1 when it cannot be read).
+int StockOfGood(void* building, int goodType)
+{
+    __try {
+        if (!building) return -1;
+        uint8_t* b = static_cast<uint8_t*>(building);
+        uint8_t* items = *reinterpret_cast<uint8_t**>(b + kInvData);
+        int num = *reinterpret_cast<int*>(b + kInvNum);
+        if (!items || num < 0 || num > 4096) return -1;
+        for (int i = 0; i < num; ++i) {
+            uint8_t* g = items + i * kGoodStride;
+            if (*reinterpret_cast<int*>(g) == goodType) return *reinterpret_cast<int*>(g + 4);
+        }
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+// Adds to what a building already holds of one good. Returns the new amount, or -1.
+int AddStockOfGood(void* building, int goodType, int extra)
+{
+    __try {
+        if (!building || extra <= 0) return -1;
+        uint8_t* b = static_cast<uint8_t*>(building);
+        uint8_t* items = *reinterpret_cast<uint8_t**>(b + kInvData);
+        int num = *reinterpret_cast<int*>(b + kInvNum);
+        if (!items || num < 0 || num > 4096) return -1;
+        for (int i = 0; i < num; ++i) {
+            uint8_t* g = items + i * kGoodStride;
+            if (*reinterpret_cast<int*>(g) == goodType) {
+                int* amt = reinterpret_cast<int*>(g + 4);
+                *amt += extra;
+                return *amt;
+            }
+        }
+        return -1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
 }
 
 // ECropType of a field, or -1 when it cannot be read
@@ -799,8 +845,9 @@ DWORD WINAPI ProdListThread(LPVOID)
         // build deliberately leaves alone (an AI lord's buildings, fields and regions).
         for (int k = 0; k < 2; ++k) {
             Sleep(k == 0 ? 60000 : 240000);
-            LogLate("[Owner check] scaled/left alone - production %ld/%ld, crop yield %ld/%ld, immigration %ld/%ld",
-                    g_ownProd[0], g_ownProd[1], g_ownCrop[0], g_ownCrop[1], g_ownImm[0], g_ownImm[1]);
+            LogLate("[Owner check] scaled/left alone - production %ld/%ld, crop yield %ld/%ld, immigration %ld/%ld, backyard %ld/%ld",
+                    g_ownProd[0], g_ownProd[1], g_ownCrop[0], g_ownCrop[1], g_ownImm[0], g_ownImm[1],
+                    g_ownYard[0], g_ownYard[1]);
             LARGE_INTEGER freq;
             QueryPerformanceFrequency(&freq);
             const char* names[3] = { "plant yield", "growth", "craft count" };
@@ -832,26 +879,95 @@ DWORD WINAPI ProdListThread(LPVOID)
 const char* kByproductAnchorSig = "C7 03 DD 00 00 00 0F 57 C0 C7 43 04 01 00 00 00";  // milk
 const int kByproductWindow = 0x800;   // the three calls sit a little before the anchor
 
+// Two ways a by-product reaches the plot: the daily ones (eggs, milk) are written straight
+// into the plot's inventory and only reported through the grant list, while what comes off a
+// slaughtered animal (pork, chevon, hides) is handed to the inventory at the end of the step
+// as a list. Both are covered; the small record below keeps a good from being raised twice
+// when the same pass takes both routes.
+struct TopUp { void* plot; int good; };
+TopUp g_topUp[8] = {};
+int g_topUpCount = 0;
+
+void RememberTopUp(void* plot, int good)
+{
+    if (g_topUpCount < 8) { g_topUp[g_topUpCount].plot = plot; g_topUp[g_topUpCount].good = good; ++g_topUpCount; }
+}
+
+bool AlreadyToppedUp(void* plot, int good)
+{
+    for (int i = 0; i < g_topUpCount; ++i)
+        if (g_topUp[i].plot == plot && g_topUp[i].good == good) return true;
+    return false;
+}
+
+using InventoryAddFn = void*(__fastcall*)(void*, void*, void*, void*);
+InventoryAddFn g_origInventoryAdd = nullptr;
+const size_t kInventoryOffset = 0x438;
+
 using YieldModifierFn = float(__fastcall*)(void*);
 using AddGoodsFn = void*(__fastcall*)(void*, int, int, void*);
+using GrantGoodsFn = void*(__fastcall*)(void*, void*, void*, void*);
 YieldModifierFn g_origYieldModifier = nullptr;
 AddGoodsFn g_origAddGoods = nullptr;
+GrantGoodsFn g_origGrantGoods = nullptr;
 float g_backyardMul = 1.0f;        // how much more often
 float g_backyardAmount = 1.0f;     // how much per delivery
 const size_t kBuildingStore = 0x360;   // what the by-product step passes as rcx
 
+
+void* g_lastByproductPlot = nullptr;   // the plot the step is working on right now
+
 float __fastcall ByproductModifierHook(void* building)
 {
+    if (building != g_lastByproductPlot) g_topUpCount = 0;
+    g_lastByproductPlot = building;
     float v = g_origYieldModifier(building);
-    if (g_backyardMul > 1.0f && v > 0.0f && IsPlayerBuilding(building)) v *= g_backyardMul;
+    bool mine = IsPlayerBuilding(building);
+    InterlockedIncrement(&g_ownYard[mine ? 0 : 1]);
+    if (g_backyardMul > 1.0f && v > 0.0f && mine) v *= g_backyardMul;
     return v;
+}
+
+// The step hands the goods over as a one-element list: { FGood* data; int count; int cap },
+// each FGood being { int type; int amount; ... } of 0x18 bytes. The amounts in that list are
+// what actually lands in the settlement, so they are scaled here, for the player's region only.
+const size_t kGoodStride18 = 0x18;
+
+void* __fastcall ByproductGrantHook(void* region, void* list, void* a3, void* a4)
+{
+    __try {
+        bool mine = IsPlayerBuilding(g_lastByproductPlot) ||
+                    (region && IsPlayerOwned(static_cast<uint8_t*>(region), kRegionEngine, kRegionOwnerPawn));
+        // The step has just written the by-product straight into the plot's own inventory
+        // (plot+438h) and only reports it through this list, so the extra is added to the
+        // inventory here and the list is raised to match what the plot now holds.
+        if (g_backyardAmount > 1.0f && list && mine) {
+            uint8_t* data = *reinterpret_cast<uint8_t**>(list);
+            int count = *reinterpret_cast<int*>(static_cast<uint8_t*>(list) + 8);
+            if (data && count > 0 && count < 256) {
+                for (int i = 0; i < count; ++i) {
+                    int type = *reinterpret_cast<int*>(data + i * kGoodStride18);
+                    int* amt = reinterpret_cast<int*>(data + i * kGoodStride18 + 4);
+                    if (*amt <= 0) continue;
+                    int scaled = static_cast<int>(*amt * g_backyardAmount + 0.5f);
+                    if (scaled > 10000) scaled = 10000;
+                    int extra = scaled - *amt;
+                    if (extra > 0 && AddStockOfGood(g_lastByproductPlot, type, extra) > 0) {
+                        *amt = scaled;
+                        RememberTopUp(g_lastByproductPlot, type);
+                    }
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return g_origGrantGoods(region, list, a3, a4);
 }
 
 void* __fastcall ByproductAddGoodsHook(void* store, int goodType, int amount, void* rest)
 {
     if (g_backyardAmount > 1.0f && amount > 0 && store) {
-        uint8_t* plot = static_cast<uint8_t*>(store) - kBuildingStore;
-        if (IsPlayerBuilding(plot)) {
+        if (IsPlayerBuilding(g_lastByproductPlot)) {
             int scaled = static_cast<int>(amount * g_backyardAmount + 0.5f);
             if (scaled > amount) amount = (scaled > 10000) ? 10000 : scaled;
         }
@@ -923,9 +1039,71 @@ bool InstallByproductHook(uint8_t* text, size_t textSize)
     return true;
 }
 
-// The handover calls: "mov rcx,[rdi+360h]" a few bytes before "call <add goods>".
+// The calls of the by-product step, located by what is loaded into rcx just before them:
+//   "mov rcx,[rdi+360h]" -> the handover that registers the goods
+//   "mov rcx,[rdi+2C8h]" -> the grant that puts the goods into the settlement (takes the list)
 const char* kByproductStoreSig = "48 8B 8F 60 03 00 00";
-const int kByproductAfter = 0x400;    // the last handovers sit past the anchor
+const char* kByproductRegionSig = "48 8B 8F C8 02 00 00";
+const int kByproductAfter = 0x400;    // the last calls sit past the anchor
+
+// Collects the calls in [from, to) that follow the given "mov rcx, [rdi+...]", keeping only
+// those that go to the one target most of them share.
+static std::vector<uint8_t*> CallsAfter(uint8_t* from, uint8_t* to, const char* rcxSig, uint8_t** targetOut)
+{
+    std::vector<int> sig;
+    ParseHex(rcxSig, sig);
+    std::vector<uint8_t*> found;
+    std::vector<uint8_t*> targets;
+    for (uint8_t* p = from; p < to; ++p) {
+        bool match = true;
+        for (size_t i = 0; i < sig.size(); ++i)
+            if (p[i] != static_cast<uint8_t>(sig[i])) { match = false; break; }
+        if (!match) continue;
+        for (uint8_t* q = p + sig.size(); q < p + 40; ++q) {
+            if (*q != 0xE8) continue;
+            found.push_back(q);
+            targets.push_back(q + 5 + *reinterpret_cast<int32_t*>(q + 1));
+            break;
+        }
+    }
+    uint8_t* best = nullptr;
+    size_t bestN = 0;
+    for (size_t i = 0; i < targets.size(); ++i) {
+        size_t n = 0;
+        for (size_t k = 0; k < targets.size(); ++k) if (targets[k] == targets[i]) ++n;
+        if (n > bestN) { bestN = n; best = targets[i]; }
+    }
+    std::vector<uint8_t*> sites;
+    for (size_t i = 0; i < found.size(); ++i)
+        if (targets[i] == best) sites.push_back(found[i]);
+    *targetOut = best;
+    return sites;
+}
+
+void* __fastcall ByproductInventoryAddHook(void* inventory, void* list, void* a3, void* a4)
+{
+    __try {
+        uint8_t* plot = inventory ? static_cast<uint8_t*>(inventory) - kInventoryOffset : nullptr;
+        if (g_backyardAmount > 1.0f && list && IsPlayerBuilding(plot)) {
+            uint8_t* data = *reinterpret_cast<uint8_t**>(list);
+            int count = *reinterpret_cast<int*>(static_cast<uint8_t*>(list) + 8);
+            if (data && count > 0 && count < 256) {
+                for (int i = 0; i < count; ++i) {
+                    int type = *reinterpret_cast<int*>(data + i * kGoodStride18);
+                    int* amt = reinterpret_cast<int*>(data + i * kGoodStride18 + 4);
+                    if (*amt <= 0 || AlreadyToppedUp(plot, type)) continue;
+                    int scaled = static_cast<int>(*amt * g_backyardAmount + 0.5f);
+                    if (scaled > *amt) *amt = (scaled > 10000) ? 10000 : scaled;
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return g_origInventoryAdd(inventory, list, a3, a4);
+}
+
+// "lea rcx,[rdi+438h]" - the plot's own inventory - a few bytes before the call
+const char* kByproductInventorySig = "48 8D 8F 38 04 00 00";
 
 bool InstallByproductAmountHook(uint8_t* text, size_t textSize)
 {
@@ -941,31 +1119,32 @@ bool InstallByproductAmountHook(uint8_t* text, size_t textSize)
     uint8_t* to = anchor + kByproductAfter;
     if (to > text + textSize - 8) to = text + textSize - 8;
 
-    std::vector<int> storeSig;
-    ParseHex(kByproductStoreSig, storeSig);
-    std::vector<uint8_t*> sites;
-    uint8_t* target = nullptr;
-    for (uint8_t* p = from; p < to; ++p) {
-        bool match = true;
-        for (size_t i = 0; i < storeSig.size(); ++i)
-            if (p[i] != static_cast<uint8_t>(storeSig[i])) { match = false; break; }
-        if (!match) continue;
-        for (uint8_t* q = p + 7; q < p + 40; ++q) {
-            if (*q != 0xE8) continue;
-            uint8_t* t = q + 5 + *reinterpret_cast<int32_t*>(q + 1);
-            if (!target) target = t;
-            if (t == target) sites.push_back(q);
-            break;
-        }
-    }
-    if (!target || sites.size() < 4) {
-        Log("[Backyard] amount: %zu handover calls found - SKIPPED", sites.size());
+    // The grant is what actually puts the goods in the settlement, so it is the one that
+    // decides how much arrives; the handover only registers the same amount afterwards.
+    uint8_t* grantFn = nullptr;
+    std::vector<uint8_t*> grants = CallsAfter(from, to, kByproductRegionSig, &grantFn);
+    if (!grantFn || grants.size() < 4) {
+        Log("[Backyard] amount: %zu grant calls found - SKIPPED", grants.size());
         return false;
     }
-    g_origAddGoods = reinterpret_cast<AddGoodsFn>(target);
-    if (!RedirectCalls(sites, &ByproductAddGoodsHook, "[Backyard]")) return false;
-    Log("[Backyard] by-product amount hooked at %zu handovers (x%.2f, player plots only)",
-        sites.size(), g_backyardAmount);
+    g_origGrantGoods = reinterpret_cast<GrantGoodsFn>(grantFn);
+    if (!RedirectCalls(grants, &ByproductGrantHook, "[Backyard]")) return false;
+
+    uint8_t* invFn = nullptr;
+    std::vector<uint8_t*> invAdds = CallsAfter(from, to, kByproductInventorySig, &invFn);
+    if (invFn && !invAdds.empty()) {
+        g_origInventoryAdd = reinterpret_cast<InventoryAddFn>(invFn);
+        RedirectCalls(invAdds, &ByproductInventoryAddHook, "[Backyard]");
+    }
+
+    uint8_t* addFn = nullptr;
+    std::vector<uint8_t*> handovers = CallsAfter(from, to, kByproductStoreSig, &addFn);
+    if (addFn && handovers.size() >= 4) {
+        g_origAddGoods = reinterpret_cast<AddGoodsFn>(addFn);
+        RedirectCalls(handovers, &ByproductAddGoodsHook, "[Backyard]");
+    }
+    Log("[Backyard] by-product amount hooked at %zu grants, %zu inventory adds and %zu handovers (x%.2f, player plots only)",
+        grants.size(), invAdds.size(), handovers.size(), g_backyardAmount);
     return true;
 }
 
