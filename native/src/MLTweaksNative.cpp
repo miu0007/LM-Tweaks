@@ -1444,6 +1444,49 @@ void __fastcall RegionUiHook(void* pawnPtr)
     g_origRegionUi(pawnPtr);
 }
 
+// ---------------------------------------------------------------------------
+// DefeatWatch: read-only. The game declares a defeat when the player's region list is empty
+// or when no region has a single family left (checkAndTriggerGameOver sums workerFamilies
+// over pawn+A48h). This logs both numbers whenever they change, so a save that ends in a
+// surprise defeat shows which of the two ran out and when.
+// ---------------------------------------------------------------------------
+const size_t kPawnRegionsData = 0xA48, kPawnRegionsNum = 0xA50;
+const size_t kRegionFamiliesNum = 0x4F0;   // workerFamilies: data at 4E8h, count here
+
+DWORD WINAPI DefeatWatchThread(LPVOID)
+{
+    char last[256] = {};
+    int lines = 0;
+    while (lines < 60) {
+        Sleep(5000);
+        char now[256] = {};
+        __try {
+            uint8_t* pawn = g_playerRef;
+            if (!pawn) continue;
+            uint8_t** regions = *reinterpret_cast<uint8_t***>(pawn + kPawnRegionsData);
+            int num = *reinterpret_cast<int*>(pawn + kPawnRegionsNum);
+            if (num < 0 || num > 64) continue;
+            int used = _snprintf_s(now, _TRUNCATE, "regions %d:", num);
+            for (int i = 0; i < num && regions; ++i) {
+                uint8_t* r = regions[i];
+                if (!r) { used += _snprintf_s(now + used, sizeof(now) - used, _TRUNCATE, " (none)"); continue; }
+                int fam = *reinterpret_cast<int*>(r + kRegionFamiliesNum);
+                bool mine = *reinterpret_cast<uint8_t**>(r + kRegionOwnerPawn) == pawn;
+                used += _snprintf_s(now + used, sizeof(now) - used, _TRUNCATE,
+                                    " %d famil%s%s", fam, fam == 1 ? "y" : "ies", mine ? "" : " (not ours!)");
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            _snprintf_s(now, _TRUNCATE, "could not be read");
+        }
+        if (now[0] && strcmp(now, last) != 0) {
+            LogLate("[Defeat watch] %s", now);
+            strcpy_s(last, now);
+            ++lines;
+        }
+    }
+    return 0;
+}
+
 bool InstallRegionUiGuard(uint8_t* text, size_t textSize)
 {
     std::vector<int> sig;
@@ -1638,6 +1681,7 @@ void ApplyPatches()
 
     // Always on: a crash in the game's own region panel refresh, see RegionUiGuard above.
     InstallRegionUiGuard(text, textSize);
+    CloseHandle(CreateThread(nullptr, 0, DefeatWatchThread, nullptr, 0, nullptr));
 
     for (const Patch& p : kPatches) {
         if (!GroupEnabled(cfg, p.group)) { Log("[%s] %s: disabled", p.group, p.name); continue; }
