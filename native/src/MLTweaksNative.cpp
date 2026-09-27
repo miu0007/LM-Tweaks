@@ -822,19 +822,61 @@ DWORD WINAPI ProdListThread(LPVOID)
 // which is also how the game's own backyard-animal perk speeds it up. The three calls to that
 // function inside the by-product step are redirected here, so the wait can be shortened for
 // the player's plots only; every other use of the function is untouched.
+//
+// The same step hands the goods over with eight calls of the shape
+//     mov rcx,[plot+360h] / mov edx,<good> / <amount in r8d> / call <add goods>
+// for eggs, chicken, pork, milk, chevon, hides, honey and wax. Those calls are redirected too,
+// and the amount is scaled there. The plot comes straight out of rcx (rcx - 360h), so the
+// owner is checked per call without remembering anything between calls.
 // ---------------------------------------------------------------------------
 const char* kByproductAnchorSig = "C7 03 DD 00 00 00 0F 57 C0 C7 43 04 01 00 00 00";  // milk
 const int kByproductWindow = 0x800;   // the three calls sit a little before the anchor
 
 using YieldModifierFn = float(__fastcall*)(void*);
+using AddGoodsFn = void*(__fastcall*)(void*, int, int, void*);
 YieldModifierFn g_origYieldModifier = nullptr;
-float g_backyardMul = 1.0f;
+AddGoodsFn g_origAddGoods = nullptr;
+float g_backyardMul = 1.0f;        // how much more often
+float g_backyardAmount = 1.0f;     // how much per delivery
+const size_t kBuildingStore = 0x360;   // what the by-product step passes as rcx
 
 float __fastcall ByproductModifierHook(void* building)
 {
     float v = g_origYieldModifier(building);
     if (g_backyardMul > 1.0f && v > 0.0f && IsPlayerBuilding(building)) v *= g_backyardMul;
     return v;
+}
+
+void* __fastcall ByproductAddGoodsHook(void* store, int goodType, int amount, void* rest)
+{
+    if (g_backyardAmount > 1.0f && amount > 0 && store) {
+        uint8_t* plot = static_cast<uint8_t*>(store) - kBuildingStore;
+        if (IsPlayerBuilding(plot)) {
+            int scaled = static_cast<int>(amount * g_backyardAmount + 0.5f);
+            if (scaled > amount) amount = (scaled > 10000) ? 10000 : scaled;
+        }
+    }
+    return g_origAddGoods(store, goodType, amount, rest);
+}
+
+// Point a set of "call rel32" sites at a hook, through one small block allocated near them.
+bool RedirectCalls(const std::vector<uint8_t*>& sites, void* hook, const char* what)
+{
+    if (sites.empty()) return false;
+    uint8_t* cave = AllocNear(sites[0], 32);
+    if (!cave) { Log("%s could not allocate near memory", what); return false; }
+    cave[0] = 0xFF; cave[1] = 0x25; *reinterpret_cast<uint32_t*>(cave + 2) = 0;
+    *reinterpret_cast<uint64_t*>(cave + 6) = reinterpret_cast<uint64_t>(hook);
+    if (!SealCode(cave, 32)) { Log("%s VirtualProtect on the cave failed", what); return false; }
+
+    for (size_t i = 0; i < sites.size(); ++i) {
+        int64_t rel = reinterpret_cast<int64_t>(cave) - reinterpret_cast<int64_t>(sites[i] + 5);
+        if (rel > INT32_MAX || rel < INT32_MIN) { Log("%s cave out of range", what); return false; }
+        std::vector<int> patch;
+        for (int k = 0; k < 4; ++k) patch.push_back(static_cast<int>((static_cast<uint32_t>(rel) >> (8 * k)) & 0xFF));
+        if (!WriteCode(sites[i] + 1, patch)) { Log("%s VirtualProtect failed", what); return false; }
+    }
+    return true;
 }
 
 bool InstallByproductHook(uint8_t* text, size_t textSize)
@@ -874,22 +916,56 @@ bool InstallByproductHook(uint8_t* text, size_t textSize)
     if (sites.size() != 3) { Log("[Backyard] by-product step: %zu call sites - SKIPPED", sites.size()); return false; }
 
     g_origYieldModifier = reinterpret_cast<YieldModifierFn>(best);
-    uint8_t* cave = AllocNear(sites[0], 32);
-    if (!cave) { Log("[Backyard] could not allocate near memory"); return false; }
-    cave[0] = 0xFF; cave[1] = 0x25; *reinterpret_cast<uint32_t*>(cave + 2) = 0;
-    *reinterpret_cast<uint64_t*>(cave + 6) = reinterpret_cast<uint64_t>(&ByproductModifierHook);
-    if (!SealCode(cave, 32)) { Log("[Backyard] VirtualProtect on the cave failed"); return false; }
-
-    for (size_t i = 0; i < sites.size(); ++i) {
-        int64_t rel = reinterpret_cast<int64_t>(cave) - reinterpret_cast<int64_t>(sites[i] + 5);
-        if (rel > INT32_MAX || rel < INT32_MIN) { Log("[Backyard] cave out of range"); return false; }
-        std::vector<int> patch;
-        for (int k = 0; k < 4; ++k) patch.push_back(static_cast<int>((static_cast<uint32_t>(rel) >> (8 * k)) & 0xFF));
-        if (!WriteCode(sites[i] + 1, patch)) { Log("[Backyard] VirtualProtect failed"); return false; }
-    }
+    if (!RedirectCalls(sites, &ByproductModifierHook, "[Backyard]")) return false;
     Log("[Backyard] by-product wait hooked at exe+0x%llX and 2 more (x%.2f, player plots only)",
         static_cast<unsigned long long>(sites[0] - reinterpret_cast<uint8_t*>(GetModuleHandleA(nullptr))),
         g_backyardMul);
+    return true;
+}
+
+// The handover calls: "mov rcx,[rdi+360h]" a few bytes before "call <add goods>".
+const char* kByproductStoreSig = "48 8B 8F 60 03 00 00";
+const int kByproductAfter = 0x400;    // the last handovers sit past the anchor
+
+bool InstallByproductAmountHook(uint8_t* text, size_t textSize)
+{
+    std::vector<int> sig;
+    ParseHex(kByproductAnchorSig, sig);
+    auto hits = FindAll(text, textSize, sig);
+    if (hits.size() != 1) {
+        Log("[Backyard] amount: anchor found %zu times - SKIPPED", hits.size());
+        return false;
+    }
+    uint8_t* anchor = hits[0];
+    uint8_t* from = (anchor - text > kByproductWindow) ? anchor - kByproductWindow : text;
+    uint8_t* to = anchor + kByproductAfter;
+    if (to > text + textSize - 8) to = text + textSize - 8;
+
+    std::vector<int> storeSig;
+    ParseHex(kByproductStoreSig, storeSig);
+    std::vector<uint8_t*> sites;
+    uint8_t* target = nullptr;
+    for (uint8_t* p = from; p < to; ++p) {
+        bool match = true;
+        for (size_t i = 0; i < storeSig.size(); ++i)
+            if (p[i] != static_cast<uint8_t>(storeSig[i])) { match = false; break; }
+        if (!match) continue;
+        for (uint8_t* q = p + 7; q < p + 40; ++q) {
+            if (*q != 0xE8) continue;
+            uint8_t* t = q + 5 + *reinterpret_cast<int32_t*>(q + 1);
+            if (!target) target = t;
+            if (t == target) sites.push_back(q);
+            break;
+        }
+    }
+    if (!target || sites.size() < 4) {
+        Log("[Backyard] amount: %zu handover calls found - SKIPPED", sites.size());
+        return false;
+    }
+    g_origAddGoods = reinterpret_cast<AddGoodsFn>(target);
+    if (!RedirectCalls(sites, &ByproductAddGoodsHook, "[Backyard]")) return false;
+    Log("[Backyard] by-product amount hooked at %zu handovers (x%.2f, player plots only)",
+        sites.size(), g_backyardAmount);
     return true;
 }
 
@@ -1428,10 +1504,13 @@ void ApplyPatches()
         InstallProductionHook(text, textSize);
     else Log("[Production] disabled");
 
-    // Backyard=F : how much faster backyard animals hand in eggs / milk / pork
-    g_backyardMul = ConfigFloat(cfg, "Backyard", 1.0f);
+    // BackyardSpeed / BackyardAmount=F : how often, and how much, backyard animals hand in
+    g_backyardMul = ConfigFloat(cfg, "BackyardSpeed", 1.0f);
+    g_backyardAmount = ConfigFloat(cfg, "BackyardAmount", 1.0f);
     if (g_backyardMul > 1.0f && g_backyardMul <= 100.0f) InstallByproductHook(text, textSize);
-    else Log("[Backyard] disabled");
+    else Log("[Backyard] wait unchanged");
+    if (g_backyardAmount > 1.0f && g_backyardAmount <= 1000.0f) InstallByproductAmountHook(text, textSize);
+    else Log("[Backyard] amount unchanged");
 
     // Immigration=F : multiplier for the families that move into the player's region
     g_immigrationMul = ConfigFloat(cfg, "Immigration", 1.0f);
