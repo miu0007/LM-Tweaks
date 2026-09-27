@@ -125,8 +125,6 @@ These are implemented but their in-game effect was never confirmed. They are off
   squads without men when another squad is formed), but a squad filling past 36 men was not
   watched. The squad cap was checked.
 - Bandit camp cap and raid interval
-- The defeat crash fix: the cause is certain (three crash dumps and the game's own code all
-  agree), but the fix itself has not yet been watched preventing a crash in a live game.
 
 Everything else in the list above was checked in game.
 
