@@ -88,7 +88,7 @@ return {
     --    AI lords are not affected. 1 = leave unchanged
     ImmigrationMultiplier         = 1.0,
 
-    -- 9. Growth speed of saplings planted by foresters. 2 = twice as fast. 0 = leave unchanged
+    -- 9c. Growth speed of saplings planted by foresters. 2 = twice as fast. 0 = leave unchanged
     --    (vanilla: the first growth stage alone takes about 250 days)
     TreeGrowthRate                = 0,
 

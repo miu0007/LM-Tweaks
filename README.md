@@ -1,4 +1,4 @@
-# MLTweaks 1.2.0
+# MLTweaks 1.3.0
 
 A configurable tweak mod for **Manor Lords**. One settings file lets you scale production,
 storage, carrying, crops, wildlife and more. Out of the box it changes **nothing** - every
@@ -8,7 +8,8 @@ Tested on Manor Lords **0.8.104** (Steam) with UE4SS.
 
 Prefer no DLL at all? **MLTweaks Lite** is the same mod without the native part - see the
 optional files. It covers everything except crops, carrying, rich resources, free ox / animal
-orders, the wildlife population cap, families per house and tree growth.
+orders, the wildlife population cap, families per house, tree growth, immigration and backyard
+animals. Production output in Lite applies to every settlement, not only yours.
 
 ---
 
@@ -82,6 +83,10 @@ Each entry lists the setting name in `config.lua`.
   recover (vanilla needs two animals).
 
 ### Housing
+- `BackyardAnimalSpeed`, `BackyardAnimalAmount` - the animals on your burgage plots: how often
+  they hand something in (vanilla waits 15 days for eggs, 49 for milk, 73 for pork) and how much
+  each delivery is. Covers eggs, chicken, pork, milk, chevon, hides, honey and wax, on your own
+  plots only.
 - `ImmigrationMultiplier` - how many families move into your region each month, on top of
   the game's own approval and free housing modifiers. Arrivals come one a day at most, so a
   month tops out at about 30. Your region only.
@@ -120,6 +125,8 @@ These are implemented but their in-game effect was never confirmed. They are off
   squads without men when another squad is formed), but a squad filling past 36 men was not
   watched. The squad cap was checked.
 - Bandit camp cap and raid interval
+- The defeat crash fix: the cause is certain (three crash dumps and the game's own code all
+  agree), but the fix itself has not yet been watched preventing a crash in a live game.
 
 Everything else in the list above was checked in game.
 
@@ -187,6 +194,19 @@ None of these break a vanilla game - they just stay at the value they reached.
   supported.
 
 ## Changelog
+
+**1.3.0**
+- New: `ImmigrationMultiplier` - how many families move into your region each month.
+- New: `BackyardAnimalSpeed`, `BackyardAnimalAmount` - how often, and how much, the animals on
+  your burgage plots hand in.
+- Production output and crop yield and growth now apply to **your own** buildings and fields
+  only; an AI lord's settlement keeps vanilla values. Lite has no DLL and cannot tell the two
+  apart, so there it still applies to everyone.
+- Fixed a crash in the game itself: losing a region (an ignored claim, for instance) leaves the
+  game refreshing its goods panels from a region that is no longer there, and it dies reading
+  address 0x538. The mod now spots that case and lets the panels refresh one frame later.
+- Fixed: the mod's per-second pass over the settlement ran everything at once and stalled the
+  game for about 0.2 s each time once a village got large. It is spread over several passes now.
 
 **1.2.0**
 - New: `BurgageFamilies` - how many families a house of each level holds.

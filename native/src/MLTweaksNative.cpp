@@ -14,7 +14,7 @@
 namespace {
 
 const char* kModDir = "ue4ss\\Mods\\MLTweaks\\";
-const char* kVersion = "1.3.0-dev";
+const char* kVersion = "1.3.0";
 
 FILE* g_log = nullptr;
 
@@ -53,20 +53,6 @@ void LogLate(const char* fmt, ...)
 // with an AI lord, otherwise everything would be treated as the player's.
 volatile LONG g_ownProd[2] = {}, g_ownCrop[2] = {}, g_ownImm[2] = {}, g_ownYard[2] = {};
 
-// How long the hooks themselves take, to tell a slow hook from a slow game.
-volatile LONG64 g_hookTicks[3] = {}, g_hookCalls[3] = {};   // 0 = plant yield, 1 = growth, 2 = craft count
-
-struct HookTimer {
-    int slot;
-    LARGE_INTEGER t0;
-    explicit HookTimer(int s) : slot(s) { QueryPerformanceCounter(&t0); }
-    ~HookTimer() {
-        LARGE_INTEGER t1;
-        QueryPerformanceCounter(&t1);
-        InterlockedAdd64(&g_hookTicks[slot], t1.QuadPart - t0.QuadPart);
-        InterlockedIncrement64(&g_hookCalls[slot]);
-    }
-};
 
 struct Patch {
     const char* group;       // config key that enables this patch
@@ -804,7 +790,6 @@ volatile LONG g_prodListReady = 0;
 int __fastcall CraftCountHook(void* b)
 {
     int v = g_origCraftCount(b);
-    HookTimer timer(2);
     if (v <= 0 || !g_prodListReady) return v;
     bool mine = IsPlayerBuilding(b);
     InterlockedIncrement(&g_ownProd[mine ? 0 : 1]);
@@ -853,12 +838,6 @@ DWORD WINAPI ProdListThread(LPVOID)
             LogLate("[Owner check] scaled/left alone - production %ld/%ld, crop yield %ld/%ld, immigration %ld/%ld, backyard %ld/%ld",
                     g_ownProd[0], g_ownProd[1], g_ownCrop[0], g_ownCrop[1], g_ownImm[0], g_ownImm[1],
                     g_ownYard[0], g_ownYard[1]);
-            LARGE_INTEGER freq;
-            QueryPerformanceFrequency(&freq);
-            const char* names[3] = { "plant yield", "growth", "craft count" };
-            for (int h = 0; h < 3; ++h)
-                LogLate("[Hook cost] %-12s %lld calls, %.1f ms total", names[h],
-                        g_hookCalls[h], 1000.0 * (double)g_hookTicks[h] / (double)freq.QuadPart);
         }
         return 0;
     }
@@ -1326,14 +1305,12 @@ float CropMul(const float* table, void* building)
 // Called from the growth cave with the field in rcx; returns the growth multiplier.
 float __fastcall GrowthMulFor(void* building)
 {
-    HookTimer timer(1);
     return CropMul(g_cropGrowthMul, building);
 }
 
 int __fastcall PlantYieldHook(void* building, int plant, unsigned char a, unsigned char b, int c, void* out)
 {
     int v = g_origPlantYield(building, plant, a, b, c, out);
-    HookTimer timer(0);
     if (v <= 0) return v;
     // Garden and orchard plants are handled by the harvest-handler patch below; scaling them
     // here as well would apply the multiplier twice.
@@ -1442,49 +1419,6 @@ void __fastcall RegionUiHook(void* pawnPtr)
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
     g_origRegionUi(pawnPtr);
-}
-
-// ---------------------------------------------------------------------------
-// DefeatWatch: read-only. The game declares a defeat when the player's region list is empty
-// or when no region has a single family left (checkAndTriggerGameOver sums workerFamilies
-// over pawn+A48h). This logs both numbers whenever they change, so a save that ends in a
-// surprise defeat shows which of the two ran out and when.
-// ---------------------------------------------------------------------------
-const size_t kPawnRegionsData = 0xA48, kPawnRegionsNum = 0xA50;
-const size_t kRegionFamiliesNum = 0x4F0;   // workerFamilies: data at 4E8h, count here
-
-DWORD WINAPI DefeatWatchThread(LPVOID)
-{
-    char last[256] = {};
-    int lines = 0;
-    while (lines < 60) {
-        Sleep(5000);
-        char now[256] = {};
-        __try {
-            uint8_t* pawn = g_playerRef;
-            if (!pawn) continue;
-            uint8_t** regions = *reinterpret_cast<uint8_t***>(pawn + kPawnRegionsData);
-            int num = *reinterpret_cast<int*>(pawn + kPawnRegionsNum);
-            if (num < 0 || num > 64) continue;
-            int used = _snprintf_s(now, _TRUNCATE, "regions %d:", num);
-            for (int i = 0; i < num && regions; ++i) {
-                uint8_t* r = regions[i];
-                if (!r) { used += _snprintf_s(now + used, sizeof(now) - used, _TRUNCATE, " (none)"); continue; }
-                int fam = *reinterpret_cast<int*>(r + kRegionFamiliesNum);
-                bool mine = *reinterpret_cast<uint8_t**>(r + kRegionOwnerPawn) == pawn;
-                used += _snprintf_s(now + used, sizeof(now) - used, _TRUNCATE,
-                                    " %d famil%s%s", fam, fam == 1 ? "y" : "ies", mine ? "" : " (not ours!)");
-            }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            _snprintf_s(now, _TRUNCATE, "could not be read");
-        }
-        if (now[0] && strcmp(now, last) != 0) {
-            LogLate("[Defeat watch] %s", now);
-            strcpy_s(last, now);
-            ++lines;
-        }
-    }
-    return 0;
 }
 
 bool InstallRegionUiGuard(uint8_t* text, size_t textSize)
@@ -1681,7 +1615,6 @@ void ApplyPatches()
 
     // Always on: a crash in the game's own region panel refresh, see RegionUiGuard above.
     InstallRegionUiGuard(text, textSize);
-    CloseHandle(CreateThread(nullptr, 0, DefeatWatchThread, nullptr, 0, nullptr));
 
     for (const Patch& p : kPatches) {
         if (!GroupEnabled(cfg, p.group)) { Log("[%s] %s: disabled", p.group, p.name); continue; }
